@@ -8,6 +8,7 @@
 //! - 전환 delay(ms)가 로그로 기록된다
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use oneplayer_core::clock::{Clock, SignageClock};
 use oneplayer_core::timeline::{LayoutDefinition, LayoutElement, PlaybackScene};
@@ -41,12 +42,15 @@ pub fn create_sample_schedule(clock: &SignageClock) -> SampleSchedule {
 /// scene A를 즉시 prepare하고 T+10초 전환을 예약한다 (앱 시작 시 1회).
 pub fn bootstrap_sample_a(
     clock: &SignageClock,
-    preparer: &mut ScenePreparer,
+    preparer: &Mutex<ScenePreparer>,
     compositor: &mut DoubleBufferCompositor,
 ) {
     let now = clock.now_millis();
     let scene_a = sample_scene("sample-a", now + 10_000, now + 20_000, "#2244aa");
     let local_files = HashMap::new();
+    let Ok(mut preparer) = preparer.lock() else {
+        return;
+    };
     if let Ok(prepared_a) = preparer.prepare(&scene_a, &local_files, now) {
         compositor.preload(prepared_a);
         compositor.switch_at(scene_a.start_time_millis);
@@ -62,13 +66,16 @@ pub fn bootstrap_sample_a(
 pub fn maybe_prepare_sample_b(
     now: i64,
     schedule: &mut SampleSchedule,
-    preparer: &mut ScenePreparer,
+    preparer: &Mutex<ScenePreparer>,
     compositor: &mut DoubleBufferCompositor,
 ) {
     if schedule.b_prepared || now < schedule.prepare_b_at {
         return;
     }
     let local_files = HashMap::new();
+    let Ok(mut preparer) = preparer.lock() else {
+        return;
+    };
     if let Ok(prepared_b) = preparer.prepare(&schedule.scene_b, &local_files, now) {
         compositor.preload(prepared_b);
         compositor.switch_at(schedule.switch_b_at);

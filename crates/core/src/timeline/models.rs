@@ -160,6 +160,21 @@ impl PlaybackTimeline {
             .map(|idx| &self.scenes[idx])
     }
 
+    /// `scene_id`에 해당하는 장면의 인덱스를 반환한다.
+    pub fn scene_index(&self, scene_id: &str) -> Option<usize> {
+        self.scenes
+            .iter()
+            .position(|scene| scene.scene_id == scene_id)
+    }
+
+    /// `scene` 바로 다음 장면의 prepare window 진입 시각(T-12초)을 반환한다.
+    /// 다음 장면이 없으면 `None`.
+    pub fn following_prepare_at(&self, scene: &PlaybackScene) -> Option<i64> {
+        let idx = self.scene_index(&scene.scene_id)?;
+        let following = self.scenes.get(idx + 1)?;
+        Some(following.start_time_millis - crate::config::SCENE_PREPARE_WINDOW_MS)
+    }
+
     /// 다음에 표출할 장면을 반환한다.
     ///
     /// - 현재 장면이 있으면: 그 바로 다음 장면

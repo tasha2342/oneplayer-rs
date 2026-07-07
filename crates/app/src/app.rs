@@ -2,12 +2,13 @@
 //!
 //! 데이터 흐름:
 //! 1. 엔진(tokio 백그라운드)이 전환 명령([`SwitchCommand`])을 채널로 보낸다
-//! 2. 렌더 루프(winit `RedrawRequested`)가 명령을 받아 scene prepare
+//! 2. 렌더 루프(winit `RedrawRequested`)가 명령을 받아 scene prepare(백그라운드)
 //!    → hidden 레이어 preload → 전환 예약
 //! 3. 매 프레임 [`DoubleBufferCompositor::tick`]이 목표 시각 도달을 검사해 전환
 //! 4. 전환 결과(delay)를 엔진 콜백으로 회신해 진단 로그에 남긴다
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 
 use anyhow::Result;
 use oneplayer_core::clock::{Clock, SignageClock};
@@ -24,6 +25,18 @@ use winit::window::{Window, WindowAttributes};
 
 use crate::sample;
 
+/// 백그라운드 prepare 완료 결과.
+enum PrepareOutcome {
+    Ready {
+        scene: oneplayer_render::PreparedScene,
+        target_time_millis: i64,
+    },
+    Failed {
+        scene_id: String,
+        reason: String,
+    },
+}
+
 /// 앱 전체 상태. winit `ApplicationHandler`로 이벤트 루프에 연결된다.
 pub struct App {
     /// 앱 설정.
@@ -35,7 +48,13 @@ pub struct App {
     /// 더블버퍼 컴포지터 (창 생성 후 초기화).
     compositor: Option<DoubleBufferCompositor>,
     /// scene 준비 담당 (창 생성 후 초기화).
-    preparer: Option<ScenePreparer>,
+    preparer: Option<Arc<Mutex<ScenePreparer>>>,
+    /// 백그라운드 prepare 완료 수신.
+    prepared_rx: std_mpsc::Receiver<PrepareOutcome>,
+    /// 백그라운드 prepare 완료 발신 (spawn_blocking에서 사용).
+    prepared_tx: std_mpsc::Sender<PrepareOutcome>,
+    /// prepare 진행 중인 scene_id (중복 스폰 방지).
+    preparing: HashSet<String>,
     /// 메인 창 핸들.
     window: Option<Arc<Window>>,
     /// 엔진용 tokio 런타임 (winit이 메인 스레드를 점유하므로 별도 운용).
@@ -60,6 +79,7 @@ impl App {
         let clock = Arc::new(SignageClock::new(&settings));
         let (switch_tx, switch_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (prepared_tx, prepared_rx) = std_mpsc::channel();
 
         // 엔진 생성 후 동기화/재생 루프를 백그라운드로 시작한다.
         let engine = Arc::new(PlaybackEngine::new(
@@ -82,6 +102,9 @@ impl App {
             engine: Some(engine),
             compositor: None,
             preparer: None,
+            prepared_rx,
+            prepared_tx,
+            preparing: HashSet::new(),
             window: None,
             runtime,
             switch_rx,
@@ -91,26 +114,62 @@ impl App {
     }
 
     /// 엔진이 보낸 전환 명령들을 처리한다:
-    /// scene prepare → hidden 레이어 preload → 목표 시각 전환 예약.
+    /// scene prepare(백그라운드) → hidden 레이어 preload → 목표 시각 전환 예약.
     /// prepare 실패 시 엔진에 실패를 회신한다 (현재 화면 유지 fallback).
     fn handle_switch_commands(&mut self) {
-        while let Ok(cmd) = self.switch_rx.try_recv() {
-            let (Some(preparer), Some(compositor)) =
-                (self.preparer.as_mut(), self.compositor.as_mut())
-            else {
-                return;
-            };
-            match preparer.prepare(&cmd.scene, &cmd.local_files, self.clock.now_millis()) {
-                Ok(prepared) => {
-                    compositor.preload(prepared);
-                    compositor.switch_at(cmd.target_time_millis);
+        while let Ok(outcome) = self.prepared_rx.try_recv() {
+            match outcome {
+                PrepareOutcome::Ready {
+                    scene,
+                    target_time_millis,
+                } => {
+                    self.preparing.remove(&scene.scene.scene_id);
+                    if let Some(compositor) = self.compositor.as_mut() {
+                        compositor.preload(scene);
+                        compositor.switch_at(target_time_millis);
+                    }
                 }
-                Err(err) => {
+                PrepareOutcome::Failed { scene_id, reason } => {
+                    self.preparing.remove(&scene_id);
                     if let Some(engine) = &self.engine {
-                        engine.on_switch_failed(&cmd.scene.scene_id, &err.to_string());
+                        engine.on_switch_failed(&scene_id, &reason);
                     }
                 }
             }
+        }
+
+        while let Ok(cmd) = self.switch_rx.try_recv() {
+            let Some(preparer) = self.preparer.clone() else {
+                return;
+            };
+            if !self.preparing.insert(cmd.scene.scene_id.clone()) {
+                continue;
+            }
+            let tx = self.prepared_tx.clone();
+            let scene = cmd.scene.clone();
+            let local_files = cmd.local_files.clone();
+            let target_time_millis = cmd.target_time_millis;
+            let now_millis = self.clock.now_millis();
+            let scene_id = scene.scene_id.clone();
+            self.runtime.spawn_blocking(move || {
+                let outcome = match preparer.lock() {
+                    Ok(mut preparer) => preparer
+                        .prepare(&scene, &local_files, now_millis)
+                        .map(|prepared| PrepareOutcome::Ready {
+                            scene: prepared,
+                            target_time_millis,
+                        })
+                        .unwrap_or_else(|err| PrepareOutcome::Failed {
+                            scene_id: scene_id.clone(),
+                            reason: err.to_string(),
+                        }),
+                    Err(err) => PrepareOutcome::Failed {
+                        scene_id,
+                        reason: err.to_string(),
+                    },
+                };
+                let _ = tx.send(outcome);
+            });
         }
     }
 
@@ -120,7 +179,7 @@ impl App {
         if self.sample_mode {
             if let (Some(schedule), Some(preparer), Some(compositor)) = (
                 self.sample_schedule.as_mut(),
-                self.preparer.as_mut(),
+                self.preparer.as_ref(),
                 self.compositor.as_mut(),
             ) {
                 sample::maybe_prepare_sample_b(
@@ -189,11 +248,11 @@ impl ApplicationHandler for App {
         ))
         .expect("compositor init failed");
 
-        self.preparer = Some(ScenePreparer::new(
+        self.preparer = Some(Arc::new(Mutex::new(ScenePreparer::new(
             self.settings.canvas_width,
             self.settings.canvas_height,
             self.settings.ffmpeg_hwaccel.clone(),
-        ));
+        ))));
         self.compositor = Some(compositor);
         self.window = Some(window);
 

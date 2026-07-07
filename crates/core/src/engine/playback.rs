@@ -45,8 +45,9 @@ impl PlaybackEngine {
     /// 4. 에셋 준비 확인 — 미준비면 5초 후 재시도 (표출 시점 다운로드 금지)
     /// 5. 영상 scene이면 T-8초(preroll window)까지 대기
     /// 6. 렌더 스레드에 전환 명령 발송
-    /// 7. scene 종료 시각까지 대기 후 다음 반복
+    /// 7. 다음 scene의 prepare window까지 대기 (현재 scene 표출 중에도 다음 준비)
     async fn playback_loop(self: Arc<Self>, timeline: PlaybackTimeline, generation: u64) {
+        let mut dispatched = HashSet::new();
         loop {
             // 1. 구세대 루프면 종료.
             if self.playback_generation.load(Ordering::SeqCst) != generation {
@@ -63,6 +64,13 @@ impl PlaybackEngine {
                 sleep_ms(NO_SCENE_RETRY_MS).await;
                 continue;
             };
+
+            // 이미 전환 명령을 보낸 scene이면, 그 다음 scene의 prepare window까지 대기한다.
+            if dispatched.contains(&next.scene_id) {
+                let wake_at = next_wake_at(&timeline, next, now);
+                sleep_ms((wake_at - now).max(MIN_PLAYBACK_LOOP_DELAY_MS)).await;
+                continue;
+            }
 
             // 3. 아직 prepare window(T-12초) 전이면 진입 시각까지 대기.
             let prepare_at = next.start_time_millis - SCENE_PREPARE_WINDOW_MS;
@@ -105,12 +113,14 @@ impl PlaybackEngine {
             if self.switch_tx.send(cmd).is_err() {
                 break;
             }
+            dispatched.insert(next.scene_id.clone());
 
-            // 7. scene 종료 직전까지 대기했다가 다음 scene 처리로 넘어간다.
-            let wait_until = next.end_time_millis - MIN_PLAYBACK_LOOP_DELAY_MS;
+            // 7. 현재 scene 표출이 끝날 때까지 기다리지 않고,
+            //    바로 다음 scene의 prepare window까지 대기한다.
+            let wake_at = next_wake_at(&timeline, next, self.clock.now_millis());
             let now = self.clock.now_millis();
-            if wait_until > now {
-                sleep_ms((wait_until - now).max(MIN_PLAYBACK_LOOP_DELAY_MS)).await;
+            if wake_at > now {
+                sleep_ms((wake_at - now).max(MIN_PLAYBACK_LOOP_DELAY_MS)).await;
             }
             self.set_state(EngineState::Playing).await;
         }
@@ -188,4 +198,16 @@ impl PlaybackEngine {
 /// 밀리초 단위 tokio sleep 헬퍼.
 async fn sleep_ms(ms: i64) {
     tokio::time::sleep(std::time::Duration::from_millis(ms.max(0) as u64)).await;
+}
+
+/// 전환 명령을 보낸 뒤 다음으로 깨어날 시각을 계산한다.
+///
+/// 다음 scene이 있으면 그 scene의 prepare window(T-12초),
+/// 없으면 현재 scene 종료 직전까지 대기한다.
+fn next_wake_at(timeline: &PlaybackTimeline, scene: &PlaybackScene, now: i64) -> i64 {
+    if let Some(prepare_at) = timeline.following_prepare_at(scene) {
+        return prepare_at;
+    }
+    let end_at = scene.end_time_millis - MIN_PLAYBACK_LOOP_DELAY_MS;
+    end_at.max(now + MIN_PLAYBACK_LOOP_DELAY_MS)
 }
