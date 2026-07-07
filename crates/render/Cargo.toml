@@ -1,0 +1,17 @@
+[package]
+name = "oneplayer-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+image.workspace = true
+lru = "0.12"
+chrono.workspace = true
+oneplayer-core = { path = "../core" }
+pollster.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wgpu.workspace = true
+winit.workspace = true

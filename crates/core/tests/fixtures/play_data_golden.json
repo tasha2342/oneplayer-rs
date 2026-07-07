@@ -1,0 +1,54 @@
+{
+  "device_id": "DV-1001",
+  "date": "2026-05-20",
+  "revision": "golden-rev-1",
+  "timezone": "Asia/Seoul",
+  "server_time": "2026-05-20T14:00:00.000+09:00",
+  "slots": [
+    {
+      "start_time": "14:10:00",
+      "end_time": "14:15:00",
+      "schedule_id": 101,
+      "playlist_id": 20,
+      "items": [
+        {
+          "id": 1,
+          "playlist_id": 20,
+          "position": 0,
+          "item_type": "image",
+          "ref_id": 1,
+          "duration_seconds": 10,
+          "loop": false,
+          "file_downloads": [
+            {
+              "file_id": 28,
+              "download_url": "https://cms.example.com/files/28",
+              "revision": "ccf5f7d026cdec7d531636f5",
+              "mime_type": "image/jpeg",
+              "size_bytes": 1024
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "playlist_id": 20,
+          "position": 1,
+          "item_type": "video",
+          "ref_id": 2,
+          "duration_seconds": 30,
+          "loop": false,
+          "file_downloads": [
+            {
+              "file_id": 29,
+              "download_url": "https://cms.example.com/files/29",
+              "revision": "a1b2c3",
+              "mime_type": "video/mp4",
+              "size_bytes": 2048
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "assets": []
+}

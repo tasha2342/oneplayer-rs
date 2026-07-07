@@ -1,0 +1,15 @@
+device_id = "DV-1001"
+cms_base_url = "https://kn.jdone.co.kr/api"
+auth_token = ""
+ntp_server = "101.79.18.207"
+
+# Optional overrides (defaults shown)
+# data_dir = "%LOCALAPPDATA%/OnePlayer"
+# schedule_sync_interval_sec = 300
+# asset_preload_minutes = 5
+# max_cache_size_mb = 1024
+# canvas_width = 1080
+# canvas_height = 1920
+# fullscreen = true
+# fallback_image_path = ""
+# ffmpeg_hwaccel = "d3d11va"   # none, cuda, d3d11va, d3d12va, dxva2, qsv
