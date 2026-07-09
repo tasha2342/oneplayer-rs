@@ -5,13 +5,22 @@
 //! - 영상 preroll window: 8초 (T-8초에 preroll 시작)
 //! - 표출 시점 다운로드 금지 — 에셋 미준비 scene은 전환하지 않고 재시도
 //! - 실제 정밀 전환(T-1초 이후 frame loop)은 렌더 스레드가 담당
+//!
+//! 루프 단계 번호 (`step` 필드):
+//! 1. 세대 확인 — 타임라인 교체 시 구세대 루프 종료
+//! 2. 다음 scene 선정 — 없으면 5초 후 재시도
+//! 3. T-12초(prepare window) 전이면 그 시각까지 대기
+//! 4. 에셋 준비 확인 — 미준비면 5초 후 재시도
+//! 5. 영상 scene이면 T-8초(preroll window)까지 대기
+//! 6. 렌더 스레드에 전환 명령 발송
+//! 7. 다음 scene의 prepare window까지 대기
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::clock::Clock;
 use crate::config::{
@@ -30,6 +39,7 @@ impl PlaybackEngine {
     /// (타임라인 교체 시 구세대 루프의 전환 명령이 새 화면을 덮지 않도록).
     pub(crate) fn spawn_playback_loop(self: &Arc<Self>, timeline: PlaybackTimeline) {
         let generation = self.playback_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        info!(step = 0, generation, scene_count = timeline.scenes.len(), "playback loop spawned");
         let engine = self.clone();
         tokio::spawn(async move {
             engine.playback_loop(timeline, generation).await;
@@ -37,26 +47,25 @@ impl PlaybackEngine {
     }
 
     /// 재생 루프 본체. 다음 scene을 골라 prepare/전환을 예약하는 것을 반복한다.
-    ///
-    /// 루프 1회의 흐름:
-    /// 1. 세대 확인 — 타임라인이 교체됐으면 종료
-    /// 2. 다음 scene 선정 — 없으면 5초 후 재시도
-    /// 3. T-12초(prepare window) 전이면 그 시각까지 대기
-    /// 4. 에셋 준비 확인 — 미준비면 5초 후 재시도 (표출 시점 다운로드 금지)
-    /// 5. 영상 scene이면 T-8초(preroll window)까지 대기
-    /// 6. 렌더 스레드에 전환 명령 발송
-    /// 7. 다음 scene의 prepare window까지 대기 (현재 scene 표출 중에도 다음 준비)
     async fn playback_loop(self: Arc<Self>, timeline: PlaybackTimeline, generation: u64) {
         let mut dispatched = HashSet::new();
         loop {
-            // 1. 구세대 루프면 종료.
-            if self.playback_generation.load(Ordering::SeqCst) != generation {
+            // step 1. 구세대 루프면 종료.
+            let current_gen = self.playback_generation.load(Ordering::SeqCst);
+            if current_gen != generation {
+                info!(
+                    step = 1,
+                    generation,
+                    current_gen,
+                    "playback loop stopped (stale generation)"
+                );
                 break;
             }
 
-            // 2. 다음 표출 scene 선정.
+            // step 2. 다음 표출 scene 선정.
             let now = self.clock.now_millis();
             let Some(next) = timeline.next_scene(now) else {
+                debug!(step = 2, generation, now_millis = now, "no upcoming scene, retrying");
                 self.set_state(EngineState::Ready).await;
                 let _ = self
                     .events
@@ -65,28 +74,68 @@ impl PlaybackEngine {
                 continue;
             };
 
+            debug!(
+                step = 2,
+                generation,
+                scene_id = %next.scene_id,
+                start_time_millis = next.start_time_millis,
+                has_video = next.has_video(),
+                "next scene selected"
+            );
+
             // 이미 전환 명령을 보낸 scene이면, 그 다음 scene의 prepare window까지 대기한다.
             if dispatched.contains(&next.scene_id) {
                 let wake_at = next_wake_at(&timeline, next, now);
-                sleep_ms((wake_at - now).max(MIN_PLAYBACK_LOOP_DELAY_MS)).await;
+                let delay_ms = (wake_at - now).max(MIN_PLAYBACK_LOOP_DELAY_MS);
+                debug!(
+                    step = 2,
+                    generation,
+                    scene_id = %next.scene_id,
+                    wake_at_millis = wake_at,
+                    sleep_ms = delay_ms,
+                    "scene already dispatched, waiting for next prepare window"
+                );
+                sleep_ms(delay_ms).await;
                 continue;
             }
 
-            // 3. 아직 prepare window(T-12초) 전이면 진입 시각까지 대기.
+            // step 3. 아직 prepare window(T-12초) 전이면 진입 시각까지 대기.
             let prepare_at = next.start_time_millis - SCENE_PREPARE_WINDOW_MS;
             if now < prepare_at {
-                sleep_ms((prepare_at - now).max(MIN_PLAYBACK_LOOP_DELAY_MS)).await;
+                let delay_ms = (prepare_at - now).max(MIN_PLAYBACK_LOOP_DELAY_MS);
+                debug!(
+                    step = 3,
+                    generation,
+                    scene_id = %next.scene_id,
+                    prepare_at_millis = prepare_at,
+                    sleep_ms = delay_ms,
+                    "waiting for prepare window"
+                );
+                sleep_ms(delay_ms).await;
                 continue;
             }
 
-            // 4. 에셋이 로컬에 없으면 전환하지 않는다 (표출 시점 다운로드 금지).
+            // step 4. 에셋이 로컬에 없으면 전환하지 않는다 (표출 시점 다운로드 금지).
             if !self.scene_assets_ready(next) {
-                warn!(scene_id = %next.scene_id, "scene assets missing, retrying");
+                warn!(
+                    step = 4,
+                    generation,
+                    scene_id = %next.scene_id,
+                    asset_count = next.asset_refs.len(),
+                    "scene assets missing, retrying"
+                );
                 sleep_ms(NO_SCENE_RETRY_MS).await;
                 continue;
             }
 
             // prepare 시작을 알린다 (실제 디코드/텍스처 업로드는 렌더 스레드).
+            info!(
+                step = 4,
+                generation,
+                scene_id = %next.scene_id,
+                target_time_millis = next.start_time_millis,
+                "scene prepare started"
+            );
             self.set_state(EngineState::Preparing).await;
             let local_files = self.local_files.lock().await.clone();
             let _ = self.events.send(EngineEvent::ScenePrepared {
@@ -94,16 +143,25 @@ impl PlaybackEngine {
                 target_time_millis: next.start_time_millis,
             });
 
-            // 5. 영상 scene은 preroll window(T-8초)에 맞춰 전환 명령을 보낸다.
-            //    너무 일찍 보내면 디코더 점유 시간이 길어지기 때문.
+            // step 5. 영상 scene은 preroll window(T-8초)에 맞춰 전환 명령을 보낸다.
             if next.has_video() {
                 let preroll_at = next.start_time_millis - VIDEO_PREROLL_WINDOW_MS;
+                let now = self.clock.now_millis();
                 if now < preroll_at {
-                    sleep_ms((preroll_at - now).max(MIN_PLAYBACK_LOOP_DELAY_MS)).await;
+                    let delay_ms = (preroll_at - now).max(MIN_PLAYBACK_LOOP_DELAY_MS);
+                    debug!(
+                        step = 5,
+                        generation,
+                        scene_id = %next.scene_id,
+                        preroll_at_millis = preroll_at,
+                        sleep_ms = delay_ms,
+                        "waiting for video preroll window"
+                    );
+                    sleep_ms(delay_ms).await;
                 }
             }
 
-            // 6. 렌더 스레드로 전환 명령 발송. 수신자가 없으면 앱 종료로 보고 루프 탈출.
+            // step 6. 렌더 스레드로 전환 명령 발송. 수신자가 없으면 앱 종료로 보고 루프 탈출.
             self.set_state(EngineState::Ready).await;
             let cmd = SwitchCommand {
                 scene: next.clone(),
@@ -111,16 +169,38 @@ impl PlaybackEngine {
                 local_files,
             };
             if self.switch_tx.send(cmd).is_err() {
+                warn!(
+                    step = 6,
+                    generation,
+                    scene_id = %next.scene_id,
+                    "switch command channel closed, stopping playback loop"
+                );
                 break;
             }
+            info!(
+                step = 6,
+                generation,
+                scene_id = %next.scene_id,
+                target_time_millis = next.start_time_millis,
+                "switch command dispatched"
+            );
             dispatched.insert(next.scene_id.clone());
 
-            // 7. 현재 scene 표출이 끝날 때까지 기다리지 않고,
+            // step 7. 현재 scene 표출이 끝날 때까지 기다리지 않고,
             //    바로 다음 scene의 prepare window까지 대기한다.
             let wake_at = next_wake_at(&timeline, next, self.clock.now_millis());
             let now = self.clock.now_millis();
             if wake_at > now {
-                sleep_ms((wake_at - now).max(MIN_PLAYBACK_LOOP_DELAY_MS)).await;
+                let delay_ms = (wake_at - now).max(MIN_PLAYBACK_LOOP_DELAY_MS);
+                debug!(
+                    step = 7,
+                    generation,
+                    scene_id = %next.scene_id,
+                    wake_at_millis = wake_at,
+                    sleep_ms = delay_ms,
+                    "waiting for next prepare window"
+                );
+                sleep_ms(delay_ms).await;
             }
             self.set_state(EngineState::Playing).await;
         }
@@ -141,6 +221,7 @@ impl PlaybackEngine {
     ) {
         let delay = actual_time_millis - target_time_millis;
         info!(
+            step = 8,
             scene_id,
             target_time_millis,
             actual_time_millis,
@@ -158,7 +239,7 @@ impl PlaybackEngine {
     /// 렌더 스레드가 전환에 실패했을 때 호출하는 콜백.
     /// fallback 정책상 실패 시 현재 scene이 유지되므로 여기서는 기록만 한다.
     pub fn on_switch_failed(&self, scene_id: &str, reason: &str) {
-        warn!(scene_id, reason, "switch failed");
+        warn!(step = 8, scene_id, reason, "switch failed");
         let _ = self.events.send(EngineEvent::SwitchFailed {
             scene_id: scene_id.to_string(),
             reason: reason.to_string(),

@@ -1,9 +1,10 @@
 //! OnePlayer 앱 진입점.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 //!
 //! 역할 분담:
 //! - `main.rs`: 설정 로드, 로깅 초기화, winit 이벤트 루프 구동
 //! - [`app`]: 엔진/렌더러를 조립하는 애플리케이션 상태
-//! - [`logging`]: tracing 로거 (콘솔 + 일 단위 파일 롤링)
+//! - [`logging`]: tracing 로거 (파일 + 디버그 빌드 시 콘솔)
 //! - [`sample`]: `--sample` 데모 스케줄 (Android Phase 1 최소 동작 예제)
 //! - [`windows_power`]: Windows 절전/화면꺼짐 방지
 
