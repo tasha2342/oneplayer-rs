@@ -99,7 +99,7 @@ impl ScenePreparer {
     pub fn prepare(
         &mut self,
         scene: &PlaybackScene,
-        local_files: &HashMap<String, PathBuf>,
+        local_files: &HashMap<i64, PathBuf>,
         now_millis: i64,
     ) -> Result<PreparedScene> {
         // 1. 좌표 스케일 계산.
@@ -117,6 +117,15 @@ impl ScenePreparer {
             .iter()
             .find(|el| el.element.element_type == "video" && el.image_path.is_some());
         let video_path = video_element.and_then(|el| el.image_path.clone());
+        // 영상 파일이 실제로 존재하는지 먼저 확인한다.
+        // (ffmpeg를 띄우기 전에 걸러야 ENOENT가 hwaccel 실패로 오인되지 않는다.)
+        if let Some(path) = &video_path {
+            anyhow::ensure!(
+                path.is_file(),
+                "video asset file missing: {}",
+                path.display()
+            );
+        }
         let is_video = video_path.is_some() || scene.has_video();
         let video_decoder = match (&video_path, video_element) {
             (Some(path), Some(el)) => {

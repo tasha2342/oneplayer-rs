@@ -7,6 +7,7 @@
 //! 4. 전체 scene을 시작 시각 기준으로 정렬해 타임라인 완성
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{Local, NaiveDate, NaiveTime};
 use chrono_tz::Tz;
@@ -25,6 +26,13 @@ use super::models::{AssetRef, LayoutDefinition, LayoutElement, PlaybackScene, Pl
 /// file_id → 최상위 asset 메타데이터 조회 테이블.
 type AssetLookup<'a> = HashMap<i64, &'a PlaybackAssetDto>;
 
+/// layout id → 변환 완료된 도메인 레이아웃 공유 테이블.
+///
+/// play_data에는 동일 레이아웃이 slot마다 통째로 반복되므로,
+/// id 기준으로 한 번만 변환하고 모든 scene이 `Arc`로 공유한다
+/// (scene 수천 개 x 레이아웃 복제로 인한 메모리 낭비 방지).
+type LayoutCache = HashMap<i64, Arc<LayoutDefinition>>;
+
 /// CMS play_data를 재생 타임라인으로 변환한다.
 pub struct TimelineBuilder;
 
@@ -40,11 +48,24 @@ impl TimelineBuilder {
         // item의 file_downloads에 빠진 메타데이터(revision, size 등)를 보완할 때 사용.
         let asset_lookup: AssetLookup = data.assets.iter().map(|a| (a.file_id, a)).collect();
 
+        // 레이아웃을 id 기준으로 한 번만 변환해 둔다 (scene들이 Arc 공유).
+        let mut layout_cache: LayoutCache = HashMap::new();
+        for slot in &data.slots {
+            for item in &slot.items {
+                if let Some(layout) = &item.layout {
+                    layout_cache
+                        .entry(layout.id)
+                        .or_insert_with(|| Arc::new(layout_to_domain(layout)));
+                }
+            }
+        }
+
         let mut scenes = Vec::new();
         for slot in &data.slots {
             scenes.extend(Self::build_slot_scenes(
                 data,
                 &asset_lookup,
+                &layout_cache,
                 slot,
                 local_date,
                 zone_id,
@@ -98,6 +119,7 @@ impl TimelineBuilder {
     fn build_slot_scenes(
         data: &PlaybackDataDto,
         asset_lookup: &AssetLookup,
+        layout_cache: &LayoutCache,
         slot: &PlaybackSlotDto,
         local_date: NaiveDate,
         zone_id: Tz,
@@ -118,6 +140,7 @@ impl TimelineBuilder {
             return vec![build_scene(
                 data,
                 asset_lookup,
+                layout_cache,
                 slot.schedule_id,
                 slot.playlist_id,
                 &items[0],
@@ -143,6 +166,7 @@ impl TimelineBuilder {
         expand_slot_scenes(ExpandParams {
             data,
             asset_lookup,
+            layout_cache,
             schedule_id: slot.schedule_id,
             playlist_id: slot.playlist_id,
             items: &items,
@@ -186,6 +210,7 @@ impl TimelineBuilder {
 struct ExpandParams<'a> {
     data: &'a PlaybackDataDto,
     asset_lookup: &'a AssetLookup<'a>,
+    layout_cache: &'a LayoutCache,
     schedule_id: i64,
     playlist_id: i64,
     items: &'a [PlaybackItemDto],
@@ -227,6 +252,7 @@ fn expand_slot_scenes(p: ExpandParams) -> Vec<PlaybackScene> {
             scenes.push(build_scene(
                 p.data,
                 p.asset_lookup,
+                p.layout_cache,
                 p.schedule_id,
                 p.playlist_id,
                 item,
@@ -247,6 +273,7 @@ fn expand_slot_scenes(p: ExpandParams) -> Vec<PlaybackScene> {
 fn build_scene(
     data: &PlaybackDataDto,
     asset_lookup: &AssetLookup,
+    layout_cache: &LayoutCache,
     schedule_id: i64,
     playlist_id: i64,
     item: &PlaybackItemDto,
@@ -267,7 +294,11 @@ fn build_scene(
         end_time_millis: end_millis,
         transition: item.transition.clone(),
         loop_playback: item.loop_enabled(),
-        layout: item.layout.as_ref().map(layout_to_domain),
+        // 미리 변환해 둔 공유 레이아웃을 참조한다 (복제 없음).
+        layout: item
+            .layout
+            .as_ref()
+            .and_then(|l| layout_cache.get(&l.id).cloned()),
         asset_refs,
     }
 }

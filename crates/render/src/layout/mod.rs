@@ -5,8 +5,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use image::ImageReader;
 use oneplayer_core::timeline::{LayoutDefinition, LayoutElement, PlaybackScene};
 use tracing::debug;
@@ -28,8 +29,8 @@ pub struct RenderElement {
 /// scene 하나의 렌더 계획: 스케일 변환이 끝난 요소 목록.
 #[derive(Debug, Clone)]
 pub struct RenderPlan {
-    /// 원본 레이아웃 정의.
-    pub layout: LayoutDefinition,
+    /// 원본 레이아웃 정의 (타임라인과 공유되는 Arc).
+    pub layout: Arc<LayoutDefinition>,
     /// 캔버스(실제 표출) 해상도.
     pub canvas_width: u32,
     pub canvas_height: u32,
@@ -49,10 +50,10 @@ impl LayoutRenderer {
     /// - 각 요소의 x/y/w/h에 scale을 곱한다
     /// - z_index 오름차순 정렬 (뒤에 그릴수록 위에 보임)
     pub fn build_plan(
-        layout: &LayoutDefinition,
+        layout: &Arc<LayoutDefinition>,
         canvas_width: u32,
         canvas_height: u32,
-        local_files: &HashMap<String, PathBuf>,
+        local_files: &HashMap<i64, PathBuf>,
     ) -> RenderPlan {
         let scale_x = canvas_width as f32 / layout.width.max(1) as f32;
         let scale_y = canvas_height as f32 / layout.height.max(1) as f32;
@@ -61,14 +62,10 @@ impl LayoutRenderer {
             .elements
             .iter()
             .map(|el| {
-                // file_id로 로컬 캐시 파일을 찾는다.
-                // 키 형식이 "{file_id}_{revision}"이므로 접두사로 매칭한다.
-                let image_path = el.file_id.and_then(|fid| {
-                    local_files
-                        .iter()
-                        .find(|(k, _)| k.starts_with(&format!("{fid}_")))
-                        .map(|(_, p)| p.clone())
-                });
+                // file_id로 이 scene의 정확한 캐시 파일 경로를 찾는다.
+                // (맵은 scene의 asset_refs에서 계산되므로 revision 오선택이 없다.)
+                let image_path =
+                    el.file_id.and_then(|fid| local_files.get(&fid).cloned());
                 RenderElement {
                     element: el.clone(),
                     x: el.x as f32 * scale_x,
@@ -109,7 +106,8 @@ impl LayoutRenderer {
                 continue;
             }
             debug!(path = %path.display(), "preloading image");
-            let img = decode_image(path, el.width as u32, el.height as u32)?;
+            let img = decode_image(path, el.width as u32, el.height as u32)
+                .with_context(|| format!("image decode failed: {}", path.display()))?;
             images.insert(key, img);
         }
         Ok(images)
@@ -140,7 +138,7 @@ pub fn scene_render_plan(
     scene: &PlaybackScene,
     canvas_width: u32,
     canvas_height: u32,
-    local_files: &HashMap<String, PathBuf>,
+    local_files: &HashMap<i64, PathBuf>,
 ) -> Option<RenderPlan> {
     scene
         .layout

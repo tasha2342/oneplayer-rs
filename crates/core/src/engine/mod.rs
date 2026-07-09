@@ -16,10 +16,9 @@ mod sync;
 
 pub use state::{EngineEvent, EngineState, SwitchCommand};
 
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use anyhow::Result;
 use tokio::sync::{mpsc, Mutex};
@@ -50,8 +49,10 @@ pub struct PlaybackEngine {
     pub(crate) active_timeline: Arc<Mutex<Option<PlaybackTimeline>>>,
     /// 마지막으로 적용한 CMS revision. 같으면 play_data 재수신을 생략한다.
     pub(crate) last_revision: Arc<Mutex<Option<String>>>,
-    /// cache_key → 로컬 파일 경로 매핑 (prepare 단계에서 사용).
-    pub(crate) local_files: Arc<Mutex<HashMap<String, PathBuf>>>,
+    /// 마지막으로 화면에 표출 완료된 scene_id (렌더 스레드 콜백으로 갱신).
+    /// 재생 루프가 "지금 표출 중이어야 할 scene"과 비교해 누락을 복구한다.
+    /// 동기 콜백에서 갱신되므로 std Mutex를 사용한다.
+    pub(crate) last_switched_scene: Arc<StdMutex<Option<String>>>,
     /// 진단/UI용 이벤트 발신 채널.
     pub(crate) events: mpsc::UnboundedSender<EngineEvent>,
     /// 렌더 스레드로 보내는 전환 명령 채널.
@@ -78,7 +79,7 @@ impl PlaybackEngine {
             state: Arc::new(Mutex::new(EngineState::Idle)),
             active_timeline: Arc::new(Mutex::new(None)),
             last_revision: Arc::new(Mutex::new(None)),
-            local_files: Arc::new(Mutex::new(HashMap::new())),
+            last_switched_scene: Arc::new(StdMutex::new(None)),
             events,
             switch_tx,
             playback_generation: Arc::new(AtomicU64::new(0)),

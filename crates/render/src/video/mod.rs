@@ -370,6 +370,13 @@ impl VideoDecoder for FfmpegCliDecoder {
         target_height: u32,
         loop_playback: bool,
     ) -> Result<()> {
+        // 파일 없음(ENOENT)은 hwaccel과 무관한 실패이므로 여기서 조기에 걸러낸다.
+        // (ffmpeg가 exit -2로 죽으면 하드웨어 디코드 실패로 오인돼 원인이 가려진다.)
+        anyhow::ensure!(
+            path.is_file(),
+            "video file not found: {}",
+            path.display()
+        );
         self.stop_session();
         self.path = Some(path.to_path_buf());
         self.target_width = target_width;

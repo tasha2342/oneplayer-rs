@@ -8,14 +8,17 @@
 //!
 //! 루프 단계 번호 (`step` 필드):
 //! 1. 세대 확인 — 타임라인 교체 시 구세대 루프 종료
-//! 2. 다음 scene 선정 — 없으면 5초 후 재시도
+//! 2. 복구 확인 — 지금 표출 중이어야 할 scene이 화면과 다르면 즉시 전환
+//!    (부팅 직후 / 전환 실패 / 타임라인 교체 복구)
+//!    이후 다음 scene 선정 — 없으면 5초 후 재시도
 //! 3. T-12초(prepare window) 전이면 그 시각까지 대기
 //! 4. 에셋 준비 확인 — 미준비면 5초 후 재시도
 //! 5. 영상 scene이면 T-8초(preroll window)까지 대기
 //! 6. 렌더 스레드에 전환 명령 발송
 //! 7. 다음 scene의 prepare window까지 대기
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -24,8 +27,8 @@ use tracing::{debug, info, warn};
 
 use crate::clock::Clock;
 use crate::config::{
-    FILE_CACHE_WARM_WINDOW_MS, MIN_PLAYBACK_LOOP_DELAY_MS, NO_SCENE_RETRY_MS,
-    SCENE_PREPARE_WINDOW_MS, VIDEO_PREROLL_WINDOW_MS,
+    FILE_CACHE_WARM_WINDOW_MS, MIN_PLAYBACK_LOOP_DELAY_MS, NO_SCENE_RETRY_MS, PRECISE_WINDOW_MS,
+    SCENE_PREPARE_WINDOW_MS, VIDEO_FIRST_FRAME_WAIT_MS, VIDEO_PREROLL_WINDOW_MS,
 };
 use crate::timeline::{PlaybackScene, PlaybackTimeline};
 
@@ -48,7 +51,11 @@ impl PlaybackEngine {
 
     /// 재생 루프 본체. 다음 scene을 골라 prepare/전환을 예약하는 것을 반복한다.
     async fn playback_loop(self: Arc<Self>, timeline: PlaybackTimeline, generation: u64) {
-        let mut dispatched = HashSet::new();
+        // 전환 명령을 이미 보낸 scene (scene_id → 종료 시각).
+        // 종료 시각이 지난 항목은 주기적으로 제거해 무한 증가를 막는다.
+        let mut dispatched: HashMap<String, i64> = HashMap::new();
+        // 복구 경로의 마지막 시도 (scene_id, 시각) — 재시도 간격 제한용.
+        let mut last_recovery: Option<(String, i64)> = None;
         loop {
             // step 1. 구세대 루프면 종료.
             let current_gen = self.playback_generation.load(Ordering::SeqCst);
@@ -62,8 +69,49 @@ impl PlaybackEngine {
                 break;
             }
 
-            // step 2. 다음 표출 scene 선정.
             let now = self.clock.now_millis();
+            dispatched.retain(|_, end_time| *end_time > now);
+
+            // step 2. 복구 경로: 지금 표출 중이어야 할 scene이 화면과 다르면
+            //    즉시 전환한다 (부팅 직후 / 전환 실패 / 타임라인 교체 직후).
+            //    성공하면 on_scene_switched가 last_switched_scene을 갱신해
+            //    다음 반복부터 이 경로를 타지 않는다.
+            if let Some(current) = timeline.current_scene(now) {
+                if self.needs_recovery_dispatch(current, now, &mut last_recovery) {
+                    if self.scene_assets_ready(current) {
+                        info!(
+                            step = 2,
+                            generation,
+                            scene_id = %current.scene_id,
+                            "current scene not on screen, dispatching immediately"
+                        );
+                        let cmd = SwitchCommand {
+                            scene: current.clone(),
+                            target_time_millis: now,
+                            local_files: self.scene_local_files(current),
+                        };
+                        if self.switch_tx.send(cmd).is_err() {
+                            warn!(
+                                step = 2,
+                                generation,
+                                scene_id = %current.scene_id,
+                                "switch command channel closed, stopping playback loop"
+                            );
+                            break;
+                        }
+                    } else {
+                        warn!(
+                            step = 2,
+                            generation,
+                            scene_id = %current.scene_id,
+                            asset_count = current.asset_refs.len(),
+                            "current scene assets missing, cannot recover yet"
+                        );
+                    }
+                }
+            }
+
+            // step 2. 다음 표출 scene 선정.
             let Some(next) = timeline.next_scene(now) else {
                 debug!(step = 2, generation, now_millis = now, "no upcoming scene, retrying");
                 self.set_state(EngineState::Ready).await;
@@ -84,9 +132,12 @@ impl PlaybackEngine {
             );
 
             // 이미 전환 명령을 보낸 scene이면, 그 다음 scene의 prepare window까지 대기한다.
-            if dispatched.contains(&next.scene_id) {
+            // (복구 경로가 주기적으로 동작하도록 대기는 재시도 간격으로 상한 처리)
+            if dispatched.contains_key(&next.scene_id) {
                 let wake_at = next_wake_at(&timeline, next, now);
-                let delay_ms = (wake_at - now).max(MIN_PLAYBACK_LOOP_DELAY_MS);
+                let delay_ms = (wake_at - now)
+                    .max(MIN_PLAYBACK_LOOP_DELAY_MS)
+                    .min(NO_SCENE_RETRY_MS);
                 debug!(
                     step = 2,
                     generation,
@@ -100,9 +151,12 @@ impl PlaybackEngine {
             }
 
             // step 3. 아직 prepare window(T-12초) 전이면 진입 시각까지 대기.
+            // (복구 경로가 주기적으로 동작하도록 대기는 재시도 간격으로 상한 처리)
             let prepare_at = next.start_time_millis - SCENE_PREPARE_WINDOW_MS;
             if now < prepare_at {
-                let delay_ms = (prepare_at - now).max(MIN_PLAYBACK_LOOP_DELAY_MS);
+                let delay_ms = (prepare_at - now)
+                    .max(MIN_PLAYBACK_LOOP_DELAY_MS)
+                    .min(NO_SCENE_RETRY_MS);
                 debug!(
                     step = 3,
                     generation,
@@ -137,7 +191,9 @@ impl PlaybackEngine {
                 "scene prepare started"
             );
             self.set_state(EngineState::Preparing).await;
-            let local_files = self.local_files.lock().await.clone();
+            // 이 scene의 asset_refs에서 정확한 캐시 경로를 계산한다
+            // (전역 누적 맵 접두사 매칭 금지 — 검사한 파일 = 사용하는 파일).
+            let local_files = self.scene_local_files(next);
             let _ = self.events.send(EngineEvent::ScenePrepared {
                 scene_id: next.scene_id.clone(),
                 target_time_millis: next.start_time_millis,
@@ -184,14 +240,17 @@ impl PlaybackEngine {
                 target_time_millis = next.start_time_millis,
                 "switch command dispatched"
             );
-            dispatched.insert(next.scene_id.clone());
+            dispatched.insert(next.scene_id.clone(), next.end_time_millis);
 
             // step 7. 현재 scene 표출이 끝날 때까지 기다리지 않고,
             //    바로 다음 scene의 prepare window까지 대기한다.
+            //    (복구 경로가 주기적으로 동작하도록 대기는 재시도 간격으로 상한 처리)
             let wake_at = next_wake_at(&timeline, next, self.clock.now_millis());
             let now = self.clock.now_millis();
             if wake_at > now {
-                let delay_ms = (wake_at - now).max(MIN_PLAYBACK_LOOP_DELAY_MS);
+                let delay_ms = (wake_at - now)
+                    .max(MIN_PLAYBACK_LOOP_DELAY_MS)
+                    .min(NO_SCENE_RETRY_MS);
                 debug!(
                     step = 7,
                     generation,
@@ -211,6 +270,61 @@ impl PlaybackEngine {
         scene.asset_refs.iter().all(|a| self.assets.is_ready(a))
     }
 
+    /// scene의 asset_refs에서 `file_id → 로컬 캐시 경로`를 계산한다.
+    ///
+    /// scene이 참조하는 정확한 revision의 cache_key 경로만 담기므로,
+    /// `scene_assets_ready`로 검사한 파일과 prepare가 여는 파일이 항상 같다.
+    fn scene_local_files(&self, scene: &PlaybackScene) -> HashMap<i64, PathBuf> {
+        scene
+            .asset_refs
+            .iter()
+            .map(|a| (a.file_id, self.assets.local_path(a)))
+            .collect()
+    }
+
+    /// 복구 경로 전환이 필요한지 판단한다.
+    ///
+    /// 조건:
+    /// - 화면에 표출된 scene(`last_switched_scene`)이 현재 scene과 다르고
+    /// - (직전 scene이 표출 중이었다면) 정상 정밀 전환이 완료될 유예 시간이 지났고
+    /// - 남은 표출 시간이 재시도 간격보다 길고 (곧 끝날 scene은 건너뜀)
+    /// - 같은 scene에 대한 직전 시도로부터 재시도 간격(5초)이 지났을 때
+    ///
+    /// 시도로 판정되면 `last_recovery`를 갱신해 과도한 재발송을 막는다.
+    fn needs_recovery_dispatch(
+        &self,
+        current: &PlaybackScene,
+        now: i64,
+        last_recovery: &mut Option<(String, i64)>,
+    ) -> bool {
+        let on_screen = self
+            .last_switched_scene
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if on_screen.as_deref() == Some(current.scene_id.as_str()) {
+            return false;
+        }
+        // scene 경계 직후에는 정상 경로의 정밀 전환(tick)이 진행 중일 수 있다.
+        // 이미 다른 scene이 화면에 있으면 전환 유예(정밀 window + 영상 첫 프레임
+        // 대기 한도)가 지난 뒤에만 복구를 시도한다. 부팅 직후(on_screen 없음)는
+        // 경합할 전환이 없으므로 즉시 복구한다.
+        let switch_grace = PRECISE_WINDOW_MS + VIDEO_FIRST_FRAME_WAIT_MS;
+        if on_screen.is_some() && now - current.start_time_millis < switch_grace {
+            return false;
+        }
+        if current.end_time_millis - now <= NO_SCENE_RETRY_MS {
+            return false;
+        }
+        if let Some((scene_id, attempted_at)) = last_recovery {
+            if scene_id == &current.scene_id && now - *attempted_at < NO_SCENE_RETRY_MS {
+                return false;
+            }
+        }
+        *last_recovery = Some((current.scene_id.clone(), now));
+        true
+    }
+
     /// 렌더 스레드가 레이어 전환을 완료했을 때 호출하는 콜백.
     /// `delay = actual - target`을 로그와 이벤트로 남긴다 (목표: ±100ms).
     pub fn on_scene_switched(
@@ -219,6 +333,10 @@ impl PlaybackEngine {
         target_time_millis: i64,
         actual_time_millis: i64,
     ) {
+        // 재생 루프의 복구 판단(step 2)에 쓰이는 "화면에 표출된 scene" 기록.
+        if let Ok(mut last) = self.last_switched_scene.lock() {
+            *last = Some(scene_id.to_string());
+        }
         let delay = actual_time_millis - target_time_millis;
         info!(
             step = 8,

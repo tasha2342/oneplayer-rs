@@ -8,7 +8,7 @@
 //! - 전환 delay(ms)가 로그로 기록된다
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use oneplayer_core::clock::{Clock, SignageClock};
 use oneplayer_core::timeline::{LayoutDefinition, LayoutElement, PlaybackScene};
@@ -95,7 +95,7 @@ fn sample_scene(id: &str, start: i64, end: i64, color: &str) -> PlaybackScene {
         end_time_millis: end,
         transition: None,
         loop_playback: false,
-        layout: Some(LayoutDefinition {
+        layout: Some(Arc::new(LayoutDefinition {
             id: 1,
             name: id.into(),
             group_name: None,
@@ -124,7 +124,7 @@ fn sample_scene(id: &str, start: i64, end: i64, color: &str) -> PlaybackScene {
                 border_width: None,
                 z_index: Some(1),
             }],
-        }),
+        })),
         asset_refs: vec![],
     }
 }

@@ -66,6 +66,10 @@ pub struct SwitchCommand {
     pub scene: PlaybackScene,
     /// 전환 목표 시각 (SignageClock 기준 epoch millis).
     pub target_time_millis: i64,
-    /// cache_key → 로컬 파일 경로 (prepare 단계에서 파일 접근에 사용).
-    pub local_files: HashMap<String, PathBuf>,
+    /// file_id → 로컬 파일 경로 (prepare 단계에서 파일 접근에 사용).
+    ///
+    /// 이 scene의 `asset_refs`에서 계산한 정확한 cache_key 경로만 담는다.
+    /// 준비 검사(`is_ready`)를 통과한 파일과 실제 사용하는 파일이
+    /// 항상 동일하도록 보장한다 (옛 revision 경로 오선택 방지).
+    pub local_files: HashMap<i64, PathBuf>,
 }

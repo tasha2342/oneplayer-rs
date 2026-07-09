@@ -3,6 +3,8 @@
 //! 이 파일에는 로직이 거의 없는 순수 데이터 구조만 둔다.
 //! 변환/빌드 로직은 [`super::builder`]에 있다.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 /// 다운로드해야 할 콘텐츠 파일 하나에 대한 참조.
@@ -87,7 +89,9 @@ pub struct PlaybackScene {
     pub end_time_millis: i64,
     pub transition: Option<String>,
     pub loop_playback: bool,
-    pub layout: Option<LayoutDefinition>,
+    /// 화면 구성. 동일 레이아웃을 쓰는 scene들이 하나의 정의를 공유한다
+    /// (`Arc` — 타임라인에 scene이 수천 개여도 레이아웃 복제는 고유 개수만큼만).
+    pub layout: Option<Arc<LayoutDefinition>>,
     /// 이 장면 표출에 필요한 에셋 목록.
     pub asset_refs: Vec<AssetRef>,
 }
@@ -178,14 +182,19 @@ impl PlaybackTimeline {
     /// 다음에 표출할 장면을 반환한다.
     ///
     /// - 현재 장면이 있으면: 그 바로 다음 장면
-    /// - 현재 장면이 없고 첫 장면이 미래이면: 첫 장면
-    /// - 그 외(모든 장면이 과거): `None`
+    /// - 현재 장면이 없으면: 시작 시각이 `now_millis` 이후인 첫 장면
+    ///   (scene 사이 공백 구간에서도 미래 장면을 찾아야 스케줄이 끊기지 않는다)
+    /// - 미래 장면이 없으면: `None`
     pub fn next_scene(&self, now_millis: i64) -> Option<&PlaybackScene> {
         match self.find_scene_index(now_millis) {
             Some(idx) => self.scenes.get(idx + 1),
-            None if self.scenes.is_empty() => None,
-            None if now_millis < self.scenes[0].start_time_millis => Some(&self.scenes[0]),
-            None => None,
+            None => {
+                // 공백 구간: 시작 시각 > now 인 첫 장면을 이진 탐색으로 찾는다.
+                let idx = self
+                    .scenes
+                    .partition_point(|s| s.start_time_millis <= now_millis);
+                self.scenes.get(idx)
+            }
         }
     }
 
@@ -209,5 +218,76 @@ impl PlaybackTimeline {
         refs.sort_by(|a, b| a.cache_key().cmp(&b.cache_key()));
         refs.dedup_by(|a, b| a.cache_key() == b.cache_key());
         refs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 지정 구간의 최소 scene을 만든다.
+    fn scene(id: &str, start: i64, end: i64) -> PlaybackScene {
+        PlaybackScene {
+            scene_id: id.into(),
+            schedule_id: 1,
+            playlist_id: 1,
+            item_id: 1,
+            start_time_millis: start,
+            end_time_millis: end,
+            transition: None,
+            loop_playback: false,
+            layout: None,
+            asset_refs: vec![],
+        }
+    }
+
+    fn timeline(scenes: Vec<PlaybackScene>) -> PlaybackTimeline {
+        PlaybackTimeline {
+            device_id: "DV".into(),
+            date: "2026-07-09".into(),
+            revision: "rev".into(),
+            server_time: None,
+            generated_at: None,
+            timezone: "Asia/Seoul".into(),
+            scenes,
+        }
+    }
+
+    /// 현재 scene이 있으면 그 다음 scene을 반환해야 한다.
+    #[test]
+    fn next_scene_returns_following_scene() {
+        let t = timeline(vec![scene("a", 0, 100), scene("b", 100, 200)]);
+        assert_eq!(t.next_scene(50).unwrap().scene_id, "b");
+    }
+
+    /// 공백 구간(현재 scene 없음, 첫 scene은 과거)에서도
+    /// 미래 scene을 찾아야 한다 (BUG-2 회귀 테스트).
+    #[test]
+    fn next_scene_finds_future_scene_across_gap() {
+        let t = timeline(vec![scene("a", 0, 100), scene("b", 500, 600)]);
+        // 100~500은 공백. 수정 전에는 None을 반환해 스케줄이 영구 정지했다.
+        assert_eq!(t.next_scene(300).unwrap().scene_id, "b");
+    }
+
+    /// 첫 scene 시작 전이면 첫 scene을 반환해야 한다.
+    #[test]
+    fn next_scene_before_first_scene() {
+        let t = timeline(vec![scene("a", 100, 200)]);
+        assert_eq!(t.next_scene(10).unwrap().scene_id, "a");
+    }
+
+    /// 모든 scene이 과거면 None을 반환해야 한다.
+    #[test]
+    fn next_scene_after_all_scenes() {
+        let t = timeline(vec![scene("a", 0, 100)]);
+        assert!(t.next_scene(200).is_none());
+    }
+
+    /// 공백 구간에서는 현재 scene이 없어야 한다.
+    #[test]
+    fn current_scene_in_gap_is_none() {
+        let t = timeline(vec![scene("a", 0, 100), scene("b", 500, 600)]);
+        assert!(t.current_scene(300).is_none());
+        assert_eq!(t.current_scene(550).unwrap().scene_id, "b");
     }
 }

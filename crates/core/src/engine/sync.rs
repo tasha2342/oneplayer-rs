@@ -3,21 +3,21 @@
 //! 정책 (OnePlayer 0.4.0 계승):
 //! - sync 주기는 기본 5분
 //! - play_data 응답의 revision이 같으면 타임라인 재구성 없이 누락 에셋만 보충
+//!   (단, 타임라인 확장 window 잔량이 임계값 미만이면 재구성 — 30분 window 소진 방지)
 //! - NTP 실패 시 CMS `server_time`을 fallback으로 사용
 //! - 마지막 성공 play_data는 로컬에 캐시해 오프라인 부팅에 사용
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use chrono::{TimeZone, Utc};
 use chrono_tz::Tz;
 
 use crate::clock::{Clock, SntpClient};
-use crate::cms::CmsApiClient;
-use crate::config::DEFAULT_ZONE_ID;
+use crate::cms::{CmsApiClient, PlaybackDataDto};
+use crate::config::{DEFAULT_ZONE_ID, TIMELINE_REFRESH_THRESHOLD_MS};
 use crate::timeline::{AssetRef, PlaybackTimeline, TimelineBuilder};
 
 use super::state::{EngineEvent, EngineState};
@@ -72,27 +72,60 @@ impl PlaybackEngine {
             self.clock.apply_server_time(server_time);
         }
 
-        // 3. revision이 같으면 타임라인 교체 불필요. 누락 에셋만 보충한다.
+        // 3. revision이 같으면 원칙적으로 타임라인 교체 불필요 — 누락 에셋만 보충.
+        //    단, 다중 item slot 확장 window(미래 30분) 잔량이 임계값 미만이거나
+        //    날짜가 바뀌었으면 현재 시각 기준으로 재구성한다 (스케줄 소진 방지).
         let last = self.last_revision.lock().await.clone();
         if last.as_deref() == Some(data.revision.as_str()) {
             self.download_missing_preload_assets().await?;
+            if self.timeline_needs_refresh(&data).await {
+                info!(revision = %data.revision, "timeline window low, rebuilding");
+                let timeline = TimelineBuilder::build(&data, self.clock.now_millis());
+                // 동일 revision 재구성이므로 오프라인 캐시는 다시 쓰지 않는다.
+                self.apply_timeline(&timeline).await?;
+            }
             return Ok(());
         }
 
         // 4. revision 변경 → 타임라인 재구성.
-
         let timeline = TimelineBuilder::build(&data, self.clock.now_millis());
         // 오프라인 부팅용으로 마지막 성공 응답을 저장한다.
         CmsApiClient::save_playback_cache(&self.settings.playback_cache_path(), &data)?;
+        self.apply_timeline(&timeline).await?;
+        Ok(())
+    }
 
+    /// 활성 타임라인의 확장 window가 소진 임박인지 판단한다.
+    ///
+    /// 기준:
+    /// - 활성 타임라인이 없으면 → 재구성 필요
+    /// - 스케줄 날짜가 응답과 다르면 (자정 경과) → 재구성 필요
+    /// - 마지막 scene 시작까지 남은 시간이 임계값(2분) 미만이면 → 재구성 필요
+    async fn timeline_needs_refresh(&self, data: &PlaybackDataDto) -> bool {
+        let now = self.clock.now_millis();
+        let guard = self.active_timeline.lock().await;
+        match guard.as_ref() {
+            None => true,
+            Some(timeline) => {
+                timeline.date != data.date
+                    || timeline
+                        .scenes
+                        .last()
+                        .map_or(true, |s| s.start_time_millis - now < TIMELINE_REFRESH_THRESHOLD_MS)
+            }
+        }
+    }
+
+    /// 타임라인을 활성화한다: preload window 에셋 blocking 준비
+    /// → 나머지 백그라운드 다운로드 → 활성 타임라인 교체 → 재생 루프 재시작.
+    async fn apply_timeline(self: &Arc<Self>, timeline: &PlaybackTimeline) -> Result<()> {
         // 표출 임박(preload window) 에셋은 blocking으로 준비한다.
         self.set_state(EngineState::Downloading).await;
-        let blocking = self.preload_window_assets(&timeline);
-        let files = self.assets.ensure_assets(&blocking).await?;
-        self.local_files.lock().await.extend(files);
+        let blocking = self.preload_window_assets(timeline);
+        self.assets.ensure_assets(&blocking).await?;
 
         // 나머지 에셋은 재생을 막지 않도록 백그라운드에서 받는다.
-        self.spawn_background_downloads(&timeline, &blocking);
+        self.spawn_background_downloads(timeline, &blocking);
 
         // 새 타임라인을 활성화하고 재생 루프를 재시작한다.
         {
@@ -103,7 +136,7 @@ impl PlaybackEngine {
             revision: timeline.revision.clone(),
             scene_count: timeline.scenes.len(),
         });
-        self.spawn_playback_loop(timeline);
+        self.spawn_playback_loop(timeline.clone());
         Ok(())
     }
 
@@ -127,12 +160,7 @@ impl PlaybackEngine {
         let blocking = self.preload_window_assets(&timeline);
         self.assets.verify_all_ready(&blocking)?;
 
-        let files: HashMap<_, _> = blocking
-            .iter()
-            .map(|a| (a.cache_key(), self.assets.local_path(a)))
-            .collect();
         {
-            *self.local_files.lock().await = files;
             *self.active_timeline.lock().await = Some(timeline.clone());
             *self.last_revision.lock().await = Some(timeline.revision.clone());
         }
@@ -159,8 +187,7 @@ impl PlaybackEngine {
             return Ok(());
         }
         self.set_state(EngineState::Downloading).await;
-        let files = self.assets.ensure_assets(&missing).await?;
-        self.local_files.lock().await.extend(files);
+        self.assets.ensure_assets(&missing).await?;
         Ok(())
     }
 
