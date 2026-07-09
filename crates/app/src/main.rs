@@ -17,6 +17,7 @@ use winit::event_loop::EventLoop;
 mod app;
 mod logging;
 mod sample;
+mod settings_ui;
 #[cfg(windows)]
 mod windows_power;
 
@@ -60,6 +61,7 @@ fn main() -> Result<()> {
 /// 앱 초기화와 이벤트 루프 실행.
 fn run() -> Result<()> {
     let sample_mode = std::env::args().any(|a| a == "--sample");
+    let config_path = config_path();
     let settings = load_settings();
     logging::init(&settings)?;
     info!(
@@ -72,7 +74,7 @@ fn run() -> Result<()> {
     // winit 이벤트 루프가 메인 스레드를 점유한다.
     // 엔진은 App 내부의 tokio 런타임에서 백그라운드로 돈다.
     let event_loop = EventLoop::new().context("event loop")?;
-    let mut app = App::new(settings, sample_mode)?;
+    let mut app = App::new(settings, config_path, sample_mode)?;
     event_loop.run_app(&mut app).context("event loop run")?;
     Ok(())
 }

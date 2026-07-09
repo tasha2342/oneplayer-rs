@@ -1,7 +1,7 @@
 //! 앱 설정 (`config.toml`) 로드/저장.
 //!
 //! Android OnePlayer의 SettingsRepository에 해당한다.
-//! v1은 파일 기반이며, 설정 UI는 v2에서 추가 예정.
+//! v1.1부터 앱 내 설정 UI로 일부 항목을 편집할 수 있다.
 
 use std::path::{Path, PathBuf};
 
@@ -50,6 +50,9 @@ pub struct AppSettings {
     /// 지원: `cuda`, `d3d11va`, `d3d12va`, `dxva2`, `qsv`, `vaapi`, `vulkan` 등.
     #[serde(default = "default_ffmpeg_hwaccel")]
     pub ffmpeg_hwaccel: String,
+    /// 설정 버튼을 투명하게 처리한다 (닫힌 상태에서 버튼이 보이지 않음).
+    #[serde(default)]
+    pub settings_button_transparent: bool,
 }
 
 // ---- serde 기본값 함수들 (TOML에 항목이 없을 때 사용) ----
@@ -103,6 +106,7 @@ impl Default for AppSettings {
             fullscreen: true,
             fallback_image_path: None,
             ffmpeg_hwaccel: default_ffmpeg_hwaccel(),
+            settings_button_transparent: false,
         }
     }
 }

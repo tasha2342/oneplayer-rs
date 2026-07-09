@@ -11,5 +11,6 @@ ntp_server = "101.79.18.207"
 # canvas_width = 1080
 # canvas_height = 1920
 # fullscreen = true
+# settings_button_transparent = false
 # fallback_image_path = ""
 # ffmpeg_hwaccel = "d3d11va"   # none, cuda, d3d11va, d3d12va, dxva2, qsv

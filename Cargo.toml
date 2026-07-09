@@ -8,7 +8,7 @@ lto = true
 codegen-units = 1
 
 [workspace.package]
-version = "0.0.1"
+version = "1.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["OnePlayer"]
@@ -34,3 +34,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 wgpu = "24"
 winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"

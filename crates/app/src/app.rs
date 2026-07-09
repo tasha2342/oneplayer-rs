@@ -8,6 +8,7 @@
 //! 4. 전환 결과(delay)를 엔진 콜백으로 회신해 진단 로그에 남긴다
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 
 use anyhow::Result;
@@ -24,6 +25,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowAttributes};
 
 use crate::sample;
+use crate::settings_ui::{SettingsAction, SettingsUi};
 
 /// 백그라운드 prepare 완료 결과.
 enum PrepareOutcome {
@@ -41,6 +43,8 @@ enum PrepareOutcome {
 pub struct App {
     /// 앱 설정.
     settings: AppSettings,
+    /// 설정 파일 경로 (저장 시 사용).
+    config_path: PathBuf,
     /// 보정 클럭 (엔진과 컴포지터가 공유).
     clock: Arc<SignageClock>,
     /// 재생 엔진 (tokio 백그라운드에서 동작).
@@ -67,12 +71,14 @@ pub struct App {
     sample_mode: bool,
     /// 데모 모드의 scene B 예약 상태.
     sample_schedule: Option<sample::SampleSchedule>,
+    /// 설정 UI 오버레이 (창 생성 후 초기화).
+    settings_ui: Option<SettingsUi>,
 }
 
 impl App {
     /// 엔진과 채널을 초기화하고 백그라운드 작업을 시작한다.
     /// 렌더 관련 리소스(창/컴포지터)는 winit `resumed`에서 만든다.
-    pub fn new(settings: AppSettings, sample_mode: bool) -> Result<Self> {
+    pub fn new(settings: AppSettings, config_path: PathBuf, sample_mode: bool) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -98,6 +104,7 @@ impl App {
 
         Ok(Self {
             settings,
+            config_path,
             clock,
             engine: Some(engine),
             compositor: None,
@@ -110,7 +117,46 @@ impl App {
             switch_rx,
             sample_mode,
             sample_schedule: None,
+            settings_ui: None,
         })
+    }
+
+    /// 설정 UI 커서 표시 여부를 갱신한다.
+    fn update_cursor_visibility(&self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let show = self
+            .settings_ui
+            .as_ref()
+            .map(|ui| ui.wants_pointer(&self.settings) || ui.is_panel_open())
+            .unwrap_or(false);
+        window.set_cursor_visible(show || !self.settings.fullscreen);
+    }
+
+    /// 설정 저장 후 런타임에 반영 가능한 항목을 적용한다.
+    fn apply_saved_settings(&mut self, updated: AppSettings) {
+        let canvas_changed = updated.canvas_width != self.settings.canvas_width
+            || updated.canvas_height != self.settings.canvas_height;
+
+        self.settings = updated;
+        if let Some(ui) = self.settings_ui.as_mut() {
+            ui.sync_from_settings(&self.settings);
+        }
+
+        if canvas_changed {
+            if let Some(window) = &self.window {
+                let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
+                    self.settings.canvas_width,
+                    self.settings.canvas_height,
+                ));
+            }
+            if let Some(compositor) = self.compositor.as_mut() {
+                compositor.resize(self.settings.canvas_width, self.settings.canvas_height);
+            }
+        }
+
+        self.update_cursor_visibility();
     }
 
     /// 엔진이 보낸 전환 명령들을 처리한다:
@@ -175,6 +221,23 @@ impl App {
 
     /// 매 프레임 수행: 전환 시각 검사(tick) → 결과 회신 → 화면 그리기.
     fn render_frame(&mut self) {
+        let mut pending_save: Option<AppSettings> = None;
+        if let (Some(ui), Some(window)) = (self.settings_ui.as_mut(), self.window.as_ref()) {
+            if let SettingsAction::Save(updated) = ui.update(window, &self.settings) {
+                pending_save = Some(updated);
+            }
+            self.update_cursor_visibility();
+        }
+        if let Some(updated) = pending_save {
+            match updated.save(&self.config_path) {
+                Ok(()) => {
+                    info!(path = %self.config_path.display(), "settings saved");
+                    self.apply_saved_settings(updated);
+                }
+                Err(err) => error!(%err, "settings save failed"),
+            }
+        }
+
         // 데모 모드: scene B의 prepare 시각이 되면 예약한다.
         if self.sample_mode {
             if let (Some(schedule), Some(preparer), Some(compositor)) = (
@@ -191,6 +254,12 @@ impl App {
             }
         }
 
+        let overlay = self
+            .settings_ui
+            .as_mut()
+            .zip(self.window.clone())
+            .map(|(ui, window)| (ui as *mut SettingsUi, window));
+
         let Some(compositor) = self.compositor.as_mut() else {
             return;
         };
@@ -204,7 +273,27 @@ impl App {
                 );
             }
         }
-        let _ = compositor.render();
+
+        if let Some((ui_ptr, window)) = overlay {
+            let (device, queue, _) = compositor.gpu_resources();
+            let device = device.clone();
+            let queue = queue.clone();
+            let _ = compositor.render_with_overlay(|encoder, view, width, height| {
+                // SAFETY: ui는 render_frame 동안 App이 소유하며, overlay는 동기 호출된다.
+                let ui = unsafe { &mut *ui_ptr };
+                ui.render(
+                    &device,
+                    &queue,
+                    encoder,
+                    view,
+                    width,
+                    height,
+                    &window,
+                );
+            });
+        } else {
+            let _ = compositor.render();
+        }
     }
 }
 
@@ -254,7 +343,13 @@ impl ApplicationHandler for App {
             self.settings.ffmpeg_hwaccel.clone(),
         ))));
         self.compositor = Some(compositor);
-        self.window = Some(window);
+        self.window = Some(window.clone());
+
+        let (device, _, format) = self.compositor.as_ref().unwrap().gpu_resources();
+        let mut settings_ui = SettingsUi::new(&window, device, format);
+        settings_ui.sync_from_settings(&self.settings);
+        self.settings_ui = Some(settings_ui);
+        self.update_cursor_visibility();
 
         // 데모 모드: scene A를 즉시 예약하고 scene B 스케줄을 만든다.
         if self.sample_mode {
@@ -274,6 +369,10 @@ impl ApplicationHandler for App {
         _id: winit::window::WindowId,
         event: WindowEvent,
     ) {
+        if let (Some(ui), Some(window)) = (self.settings_ui.as_mut(), self.window.as_ref()) {
+            let _ = ui.on_window_event(window, &event);
+        }
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {

@@ -213,7 +213,11 @@ impl DoubleBufferCompositor {
 
     /// 현재 레이어 상태를 화면에 그린다 (매 프레임 호출).
     /// alpha가 0인 레이어는 그리지 않는다.
-    pub fn render(&mut self) -> Result<()> {
+    /// `overlay`가 주어지면 scene 위에 추가 패스를 그린다 (설정 UI 등).
+    pub fn render_with_overlay<F>(&mut self, overlay: F) -> Result<()>
+    where
+        F: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView, u32, u32),
+    {
         // 렌더 패스 전에 보이는 레이어의 영상 프레임을 갱신한다.
         self.update_video_frames();
 
@@ -221,6 +225,8 @@ impl DoubleBufferCompositor {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let (width, height) = (self.gpu.config.width, self.gpu.config.height);
 
         let mut encoder = self
             .gpu
@@ -261,9 +267,25 @@ impl DoubleBufferCompositor {
             }
         }
 
+        overlay(&mut encoder, &view, width, height);
+
         self.gpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
         Ok(())
+    }
+
+    /// 현재 레이어 상태를 화면에 그린다 (매 프레임 호출).
+    pub fn render(&mut self) -> Result<()> {
+        self.render_with_overlay(|_, _, _, _| {})
+    }
+
+    /// egui 오버레이 렌더링에 필요한 GPU 리소스를 반환한다.
+    pub fn gpu_resources(&self) -> (&wgpu::Device, &wgpu::Queue, wgpu::TextureFormat) {
+        (
+            &self.gpu.device,
+            &self.gpu.queue,
+            self.gpu.config.format,
+        )
     }
 
     /// 보이는 레이어의 영상 요소 텍스처를 디코더의 최신 프레임으로 갱신한다.
