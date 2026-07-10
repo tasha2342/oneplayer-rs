@@ -108,10 +108,9 @@ impl PlaybackEngine {
             None => true,
             Some(timeline) => {
                 timeline.date != data.date
-                    || timeline
-                        .scenes
-                        .last()
-                        .map_or(true, |s| s.start_time_millis - now < TIMELINE_REFRESH_THRESHOLD_MS)
+                    || timeline.scenes.last().map_or(true, |s| {
+                        s.start_time_millis - now < TIMELINE_REFRESH_THRESHOLD_MS
+                    })
             }
         }
     }

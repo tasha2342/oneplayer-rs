@@ -9,9 +9,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::Result;
 use oneplayer_core::timeline::PlaybackScene;
+use oneplayer_core::timing_log::{self, TimingValue};
 
 use crate::image::ImageCache;
 use crate::layout::{scene_render_plan, RenderPlan};
@@ -54,10 +56,13 @@ impl PreparedScene {
     /// 영상 첫 프레임이 표출 가능한 상태인지 확인한다.
     /// 컴포지터가 전환 여부를 판단할 때 사용한다 (검은 화면 방지).
     /// 영상이 아닌 scene은 항상 준비 완료로 본다.
+    ///
+    /// 렌더 스레드(프레임 tick)에서 호출되므로 블로킹 lock을 쓰지 않는다.
+    /// 디코더가 다른 스레드에 잡혀 있으면 "아직 준비 안 됨"으로 본다.
     pub fn first_frame_ready(&self) -> bool {
         match &self.video_decoder {
             Some(decoder) => decoder
-                .lock()
+                .try_lock()
                 .map(|d| d.has_first_frame())
                 .unwrap_or(false),
             None => true,
@@ -103,11 +108,81 @@ impl ScenePreparer {
         now_millis: i64,
     ) -> Result<PreparedScene> {
         // 1. 좌표 스케일 계산.
-        let plan = scene_render_plan(scene, self.canvas_width, self.canvas_height, local_files)
-            .ok_or_else(|| anyhow::anyhow!("scene has no layout"))?;
+        let layout_started = Instant::now();
+        let plan =
+            match scene_render_plan(scene, self.canvas_width, self.canvas_height, local_files) {
+                Some(plan) => {
+                    timing_log::record(
+                        "INFO",
+                        6,
+                        "LAYOUT_PLAN_DONE",
+                        Some(&scene.scene_id),
+                        Some(scene.start_time_millis),
+                        Some(now_millis),
+                        vec![
+                            (
+                                "duration_ms",
+                                TimingValue::from(layout_started.elapsed().as_millis()),
+                            ),
+                            ("element_count", TimingValue::from(plan.elements.len())),
+                        ],
+                    );
+                    plan
+                }
+                None => {
+                    timing_log::record(
+                        "ERROR",
+                        "ERROR",
+                        "LAYOUT_PLAN_EXCEPTION",
+                        Some(&scene.scene_id),
+                        Some(scene.start_time_millis),
+                        Some(now_millis),
+                        vec![("exception", TimingValue::from("scene has no layout"))],
+                    );
+                    anyhow::bail!("scene has no layout");
+                }
+            };
 
         // 2. 이미지 decode (파일 I/O + decode는 여기, 표출 시점 아님).
-        let preloaded = crate::layout::LayoutRenderer::preload_images(&plan)?;
+        let image_started = Instant::now();
+        let preloaded = match crate::layout::LayoutRenderer::preload_images(&plan) {
+            Ok(preloaded) => {
+                timing_log::record(
+                    "INFO",
+                    7,
+                    "IMAGE_PRELOAD_DONE",
+                    Some(&scene.scene_id),
+                    Some(scene.start_time_millis),
+                    Some(now_millis),
+                    vec![
+                        (
+                            "duration_ms",
+                            TimingValue::from(image_started.elapsed().as_millis()),
+                        ),
+                        ("image_count", TimingValue::from(preloaded.len())),
+                    ],
+                );
+                preloaded
+            }
+            Err(err) => {
+                timing_log::record(
+                    "ERROR",
+                    "ERROR",
+                    "IMAGE_PRELOAD_EXCEPTION",
+                    Some(&scene.scene_id),
+                    Some(scene.start_time_millis),
+                    Some(now_millis),
+                    vec![
+                        ("exception", TimingValue::from(err.to_string())),
+                        (
+                            "duration_ms",
+                            TimingValue::from(image_started.elapsed().as_millis()),
+                        ),
+                    ],
+                );
+                return Err(err);
+            }
+        };
         self.image_cache.preload(preloaded.clone());
 
         // 3. 영상 준비: 디코더를 pool에서 빌려 open + preroll.
@@ -120,11 +195,19 @@ impl ScenePreparer {
         // 영상 파일이 실제로 존재하는지 먼저 확인한다.
         // (ffmpeg를 띄우기 전에 걸러야 ENOENT가 hwaccel 실패로 오인되지 않는다.)
         if let Some(path) = &video_path {
-            anyhow::ensure!(
-                path.is_file(),
-                "video asset file missing: {}",
-                path.display()
-            );
+            if !path.is_file() {
+                let reason = format!("video asset file missing: {}", path.display());
+                timing_log::record(
+                    "ERROR",
+                    "ERROR",
+                    "VIDEO_FILE_MISSING",
+                    Some(&scene.scene_id),
+                    Some(scene.start_time_millis),
+                    Some(now_millis),
+                    vec![("exception", TimingValue::from(reason.clone()))],
+                );
+                anyhow::bail!(reason);
+            }
         }
         let is_video = video_path.is_some() || scene.has_video();
         let video_decoder = match (&video_path, video_element) {
@@ -132,13 +215,86 @@ impl ScenePreparer {
                 let decoder = self.video_pool.acquire();
                 {
                     let mut guard = decoder.lock().expect("decoder lock");
-                    guard.open(
+                    let open_started = Instant::now();
+                    if let Err(err) = guard.open(
                         path,
                         el.width.round().max(2.0) as u32,
                         el.height.round().max(2.0) as u32,
                         scene.loop_playback,
-                    )?;
-                    guard.preroll()?;
+                    ) {
+                        timing_log::record(
+                            "ERROR",
+                            "ERROR",
+                            "FFMPEG_OPEN_EXCEPTION",
+                            Some(&scene.scene_id),
+                            Some(scene.start_time_millis),
+                            Some(now_millis),
+                            vec![
+                                ("exception", TimingValue::from(err.to_string())),
+                                (
+                                    "duration_ms",
+                                    TimingValue::from(open_started.elapsed().as_millis()),
+                                ),
+                                ("path", TimingValue::from(path.display().to_string())),
+                            ],
+                        );
+                        return Err(err);
+                    }
+                    timing_log::record(
+                        "INFO",
+                        8,
+                        "FFMPEG_OPEN_DONE",
+                        Some(&scene.scene_id),
+                        Some(scene.start_time_millis),
+                        Some(now_millis),
+                        vec![
+                            (
+                                "duration_ms",
+                                TimingValue::from(open_started.elapsed().as_millis()),
+                            ),
+                            ("path", TimingValue::from(path.display().to_string())),
+                            (
+                                "target_width",
+                                TimingValue::from(el.width.round().max(2.0) as u64),
+                            ),
+                            (
+                                "target_height",
+                                TimingValue::from(el.height.round().max(2.0) as u64),
+                            ),
+                        ],
+                    );
+
+                    let preroll_started = Instant::now();
+                    if let Err(err) = guard.preroll() {
+                        timing_log::record(
+                            "ERROR",
+                            "ERROR",
+                            "FFMPEG_PREROLL_EXCEPTION",
+                            Some(&scene.scene_id),
+                            Some(scene.start_time_millis),
+                            Some(now_millis),
+                            vec![
+                                ("exception", TimingValue::from(err.to_string())),
+                                (
+                                    "duration_ms",
+                                    TimingValue::from(preroll_started.elapsed().as_millis()),
+                                ),
+                            ],
+                        );
+                        return Err(err);
+                    }
+                    timing_log::record(
+                        "INFO",
+                        9,
+                        "FFMPEG_PREROLL_DONE",
+                        Some(&scene.scene_id),
+                        Some(scene.start_time_millis),
+                        Some(now_millis),
+                        vec![(
+                            "duration_ms",
+                            TimingValue::from(preroll_started.elapsed().as_millis()),
+                        )],
+                    );
                 }
                 Some(decoder)
             }

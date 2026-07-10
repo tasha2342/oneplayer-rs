@@ -17,5 +17,8 @@ fn golden_timeline_expands_multi_item_slot() {
     assert_eq!(timeline.device_id, "DV-1001");
     assert_eq!(timeline.revision, "golden-rev-1");
     assert!(timeline.scenes.len() >= 2);
-    assert!(timeline.scenes.windows(2).all(|w| w[0].end_time_millis <= w[1].start_time_millis));
+    assert!(timeline
+        .scenes
+        .windows(2)
+        .all(|w| w[0].end_time_millis <= w[1].start_time_millis));
 }

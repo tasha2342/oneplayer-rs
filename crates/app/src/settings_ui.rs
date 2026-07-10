@@ -4,7 +4,10 @@
 //! 열린 상태에서는 CMS/디바이스/NTP/캔버스 설정을 편집할 수 있다.
 
 use egui_wgpu::ScreenDescriptor;
-use egui_winit::egui::{self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, RichText, Stroke, Vec2};
+use egui_winit::egui::{
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, RichText, Stroke,
+    Vec2,
+};
 use oneplayer_core::settings::AppSettings;
 use wgpu::{CommandEncoder, Device, Queue, TextureFormat, TextureView};
 use winit::event::WindowEvent;
@@ -269,9 +272,12 @@ fn draw_ui(
                                 RichText::new("설정 버튼 투명 처리")
                                     .color(Color32::from_rgb(210, 218, 230)),
                             );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.add(toggle_switch(draft_settings_button_transparent));
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add(toggle_switch(draft_settings_button_transparent));
+                                },
+                            );
                         });
 
                         if let Some(msg) = status_message.as_ref() {
@@ -306,36 +312,39 @@ fn draw_ui(
                                 );
                             }
 
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("저장").color(Color32::WHITE),
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("저장").color(Color32::WHITE),
+                                            )
+                                            .fill(Color32::from_rgb(0, 140, 255))
+                                            .min_size(Vec2::new(120.0, 36.0)),
                                         )
-                                        .fill(Color32::from_rgb(0, 140, 255))
-                                        .min_size(Vec2::new(120.0, 36.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    match build_settings(
-                                        settings,
-                                        draft_cms_base_url,
-                                        draft_device_id,
-                                        draft_ntp_server,
-                                        draft_canvas_width,
-                                        draft_canvas_height,
-                                        *draft_settings_button_transparent,
-                                    ) {
-                                        Ok(updated) => {
-                                            *status_message = Some("저장되었습니다.".into());
-                                            action = SettingsAction::Save(updated);
-                                        }
-                                        Err(msg) => {
-                                            *status_message = Some(msg);
+                                        .clicked()
+                                    {
+                                        match build_settings(
+                                            settings,
+                                            draft_cms_base_url,
+                                            draft_device_id,
+                                            draft_ntp_server,
+                                            draft_canvas_width,
+                                            draft_canvas_height,
+                                            *draft_settings_button_transparent,
+                                        ) {
+                                            Ok(updated) => {
+                                                *status_message = Some("저장되었습니다.".into());
+                                                action = SettingsAction::Save(updated);
+                                            }
+                                            Err(msg) => {
+                                                *status_message = Some(msg);
+                                            }
                                         }
                                     }
-                                }
-                            });
+                                },
+                            );
                         });
                     });
                 });
@@ -495,10 +504,8 @@ fn toggle_switch_ui(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     if ui.is_rect_visible(rect) {
         let how_on = ui.ctx().animate_bool_responsive(response.id, *on);
         let radius = 0.5 * rect.height();
-        let track_color = Color32::from_rgb(70, 78, 92).lerp_to_gamma(
-            Color32::from_rgb(0, 188, 170),
-            how_on,
-        );
+        let track_color =
+            Color32::from_rgb(70, 78, 92).lerp_to_gamma(Color32::from_rgb(0, 188, 170), how_on);
         let knob_color = if response.hovered() {
             Color32::from_rgb(250, 252, 255)
         } else {

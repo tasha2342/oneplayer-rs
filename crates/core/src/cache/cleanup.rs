@@ -53,11 +53,8 @@ impl AssetStore {
         )?;
 
         // 3단계: 총량 상한 초과분을 오래된 순(LRU)으로 제거.
-        let remaining_bytes = self.enforce_size_limit(
-            protected_cache_keys,
-            &mut deleted_files,
-            &mut deleted_bytes,
-        )?;
+        let remaining_bytes =
+            self.enforce_size_limit(protected_cache_keys, &mut deleted_files, &mut deleted_bytes)?;
 
         info!(
             deleted_files,
@@ -80,8 +77,7 @@ impl AssetStore {
         for entry in fs::read_dir(self.asset_dir())? {
             let path = entry?.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.ends_with(".part")
-                && file_age_millis(&path, now_millis) > STALE_PART_MAX_AGE_MS
+            if name.ends_with(".part") && file_age_millis(&path, now_millis) > STALE_PART_MAX_AGE_MS
             {
                 let size = path.metadata().map(|m| m.len()).unwrap_or(0);
                 if fs::remove_file(&path).is_ok() {

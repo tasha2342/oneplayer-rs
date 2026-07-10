@@ -10,11 +10,13 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::Result;
 use oneplayer_core::clock::{Clock, SignageClock};
 use oneplayer_core::engine::{EngineEvent, PlaybackEngine, SwitchCommand};
 use oneplayer_core::settings::AppSettings;
+use oneplayer_core::timing_log::{self, TimingValue};
 use oneplayer_render::{DoubleBufferCompositor, ScenePreparer};
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -35,6 +37,7 @@ enum PrepareOutcome {
     },
     Failed {
         scene_id: String,
+        target_time_millis: i64,
         reason: String,
     },
 }
@@ -171,12 +174,48 @@ impl App {
                 } => {
                     self.preparing.remove(&scene.scene.scene_id);
                     if let Some(compositor) = self.compositor.as_mut() {
+                        let scene_id = scene.scene.scene_id.clone();
+                        let preload_started = Instant::now();
+                        let preload_now = self.clock.now_millis();
                         compositor.preload(scene);
+                        let gpu_preload_ms = preload_started.elapsed().as_millis();
+                        let scheduled_now = self.clock.now_millis();
                         compositor.switch_at(target_time_millis);
+                        timing_log::record(
+                            "INFO",
+                            11,
+                            "GPU_PRELOAD_DONE",
+                            Some(&scene_id),
+                            Some(target_time_millis),
+                            Some(preload_now),
+                            vec![("duration_ms", TimingValue::from(gpu_preload_ms))],
+                        );
+                        timing_log::record(
+                            "INFO",
+                            12,
+                            "SWITCH_AT_SCHEDULED",
+                            Some(&scene_id),
+                            Some(target_time_millis),
+                            Some(scheduled_now),
+                            vec![],
+                        );
                     }
                 }
-                PrepareOutcome::Failed { scene_id, reason } => {
+                PrepareOutcome::Failed {
+                    scene_id,
+                    target_time_millis,
+                    reason,
+                } => {
                     self.preparing.remove(&scene_id);
+                    timing_log::record(
+                        "ERROR",
+                        "ERROR",
+                        "PREPARE_FAILED",
+                        Some(&scene_id),
+                        Some(target_time_millis),
+                        Some(self.clock.now_millis()),
+                        vec![("exception", TimingValue::from(reason.clone()))],
+                    );
                     if let Some(engine) = &self.engine {
                         engine.on_switch_failed(&scene_id, &reason);
                     }
@@ -197,20 +236,77 @@ impl App {
             let target_time_millis = cmd.target_time_millis;
             let now_millis = self.clock.now_millis();
             let scene_id = scene.scene_id.clone();
+            timing_log::record(
+                "INFO",
+                4,
+                "SWITCH_COMMAND_RECEIVED",
+                Some(&scene_id),
+                Some(target_time_millis),
+                Some(now_millis),
+                vec![
+                    ("asset_count", TimingValue::from(scene.asset_refs.len())),
+                    ("is_video", TimingValue::from(scene.has_video())),
+                ],
+            );
+            let clock = self.clock.clone();
             self.runtime.spawn_blocking(move || {
+                let prepare_started = Instant::now();
+                let prepare_start_now = clock.now_millis();
+                timing_log::record(
+                    "INFO",
+                    5,
+                    "PREPARE_BLOCKING_STARTED",
+                    Some(&scene_id),
+                    Some(target_time_millis),
+                    Some(prepare_start_now),
+                    vec![],
+                );
                 let outcome = match preparer.lock() {
-                    Ok(mut preparer) => preparer
-                        .prepare(&scene, &local_files, now_millis)
-                        .map(|prepared| PrepareOutcome::Ready {
-                            scene: prepared,
-                            target_time_millis,
-                        })
-                        .unwrap_or_else(|err| PrepareOutcome::Failed {
-                            scene_id: scene_id.clone(),
-                            reason: err.to_string(),
-                        }),
+                    Ok(mut preparer) => match preparer.prepare(&scene, &local_files, now_millis) {
+                        Ok(prepared) => {
+                            timing_log::record(
+                                "INFO",
+                                10,
+                                "PREPARE_DONE",
+                                Some(&scene_id),
+                                Some(target_time_millis),
+                                Some(clock.now_millis()),
+                                vec![(
+                                    "duration_ms",
+                                    TimingValue::from(prepare_started.elapsed().as_millis()),
+                                )],
+                            );
+                            PrepareOutcome::Ready {
+                                scene: prepared,
+                                target_time_millis,
+                            }
+                        }
+                        Err(err) => {
+                            timing_log::record(
+                                "ERROR",
+                                "ERROR",
+                                "PREPARE_EXCEPTION",
+                                Some(&scene_id),
+                                Some(target_time_millis),
+                                Some(clock.now_millis()),
+                                vec![
+                                    ("exception", TimingValue::from(err.to_string())),
+                                    (
+                                        "duration_ms",
+                                        TimingValue::from(prepare_started.elapsed().as_millis()),
+                                    ),
+                                ],
+                            );
+                            PrepareOutcome::Failed {
+                                scene_id: scene_id.clone(),
+                                target_time_millis,
+                                reason: err.to_string(),
+                            }
+                        }
+                    },
                     Err(err) => PrepareOutcome::Failed {
                         scene_id,
+                        target_time_millis,
                         reason: err.to_string(),
                     },
                 };
@@ -281,15 +377,7 @@ impl App {
             let _ = compositor.render_with_overlay(|encoder, view, width, height| {
                 // SAFETY: ui는 render_frame 동안 App이 소유하며, overlay는 동기 호출된다.
                 let ui = unsafe { &mut *ui_ptr };
-                ui.render(
-                    &device,
-                    &queue,
-                    encoder,
-                    view,
-                    width,
-                    height,
-                    &window,
-                );
+                ui.render(&device, &queue, encoder, view, width, height, &window);
             });
         } else {
             let _ = compositor.render();

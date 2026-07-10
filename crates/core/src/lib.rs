@@ -19,6 +19,7 @@ pub mod config;
 pub mod engine;
 pub mod settings;
 pub mod timeline;
+pub mod timing_log;
 
 pub use cache::{AssetStore, CacheCleanupResult};
 pub use clock::{Clock, ClockConfidence, ClockSnapshot, ClockSyncResult, SignageClock, SntpClient};

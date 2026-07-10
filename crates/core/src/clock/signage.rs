@@ -167,13 +167,13 @@ impl SignageClock {
     pub fn mark_stale(&self, reason: &str) -> ClockSnapshot {
         let current = self.snapshot();
         let next = match current.confidence {
-            ClockConfidence::Synced
-            | ClockConfidence::ServerEstimated
-            | ClockConfidence::Stale => ClockSnapshot {
-                confidence: ClockConfidence::Stale,
-                warning: Some(reason.to_string()),
-                ..current
-            },
+            ClockConfidence::Synced | ClockConfidence::ServerEstimated | ClockConfidence::Stale => {
+                ClockSnapshot {
+                    confidence: ClockConfidence::Stale,
+                    warning: Some(reason.to_string()),
+                    ..current
+                }
+            }
             ClockConfidence::DeviceClock | ClockConfidence::Unusable => {
                 device_clock_snapshot_with_warning(reason)
             }

@@ -13,6 +13,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 pub fn init(settings: &AppSettings) -> Result<()> {
     let logs_dir = settings.logs_dir();
     std::fs::create_dir_all(&logs_dir)?;
+    oneplayer_core::timing_log::init(&logs_dir)?;
     let file_appender = tracing_appender::rolling::daily(&logs_dir, "oneplayer.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     // guard가 drop되면 파일 로그가 멈추므로 프로세스 수명 동안 유지시킨다.

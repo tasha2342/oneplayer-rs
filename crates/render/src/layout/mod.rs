@@ -64,8 +64,7 @@ impl LayoutRenderer {
             .map(|el| {
                 // file_id로 이 scene의 정확한 캐시 파일 경로를 찾는다.
                 // (맵은 scene의 asset_refs에서 계산되므로 revision 오선택이 없다.)
-                let image_path =
-                    el.file_id.and_then(|fid| local_files.get(&fid).cloned());
+                let image_path = el.file_id.and_then(|fid| local_files.get(&fid).cloned());
                 RenderElement {
                     element: el.clone(),
                     x: el.x as f32 * scale_x,

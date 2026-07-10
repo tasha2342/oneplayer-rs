@@ -50,11 +50,7 @@ impl CmsApiClient {
     /// 전체 재생 데이터(슬롯/아이템/에셋)를 조회한다.
     ///
     /// `date`는 `YYYY-MM-DD` 형식 (스케줄 기준일).
-    pub async fn get_playback_data(
-        &self,
-        device_id: &str,
-        date: &str,
-    ) -> Result<PlaybackDataDto> {
+    pub async fn get_playback_data(&self, device_id: &str, date: &str) -> Result<PlaybackDataDto> {
         let url = format!(
             "{}/v1/playback/play_data?device_id={}&date={}",
             self.api_root(),

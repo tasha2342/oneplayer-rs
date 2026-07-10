@@ -31,6 +31,7 @@ use crate::config::{
     SCENE_PREPARE_WINDOW_MS, VIDEO_FIRST_FRAME_WAIT_MS, VIDEO_PREROLL_WINDOW_MS,
 };
 use crate::timeline::{PlaybackScene, PlaybackTimeline};
+use crate::timing_log::{self, TimingValue};
 
 use super::state::{EngineEvent, EngineState, SwitchCommand};
 use super::PlaybackEngine;
@@ -42,7 +43,12 @@ impl PlaybackEngine {
     /// (타임라인 교체 시 구세대 루프의 전환 명령이 새 화면을 덮지 않도록).
     pub(crate) fn spawn_playback_loop(self: &Arc<Self>, timeline: PlaybackTimeline) {
         let generation = self.playback_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        info!(step = 0, generation, scene_count = timeline.scenes.len(), "playback loop spawned");
+        info!(
+            step = 0,
+            generation,
+            scene_count = timeline.scenes.len(),
+            "playback loop spawned"
+        );
         let engine = self.clone();
         tokio::spawn(async move {
             engine.playback_loop(timeline, generation).await;
@@ -62,9 +68,7 @@ impl PlaybackEngine {
             if current_gen != generation {
                 info!(
                     step = 1,
-                    generation,
-                    current_gen,
-                    "playback loop stopped (stale generation)"
+                    generation, current_gen, "playback loop stopped (stale generation)"
                 );
                 break;
             }
@@ -113,7 +117,12 @@ impl PlaybackEngine {
 
             // step 2. 다음 표출 scene 선정.
             let Some(next) = timeline.next_scene(now) else {
-                debug!(step = 2, generation, now_millis = now, "no upcoming scene, retrying");
+                debug!(
+                    step = 2,
+                    generation,
+                    now_millis = now,
+                    "no upcoming scene, retrying"
+                );
                 self.set_state(EngineState::Ready).await;
                 let _ = self
                     .events
@@ -171,6 +180,15 @@ impl PlaybackEngine {
 
             // step 4. 에셋이 로컬에 없으면 전환하지 않는다 (표출 시점 다운로드 금지).
             if !self.scene_assets_ready(next) {
+                timing_log::record(
+                    "WARN",
+                    2,
+                    "ASSET_CHECK_FAILED",
+                    Some(&next.scene_id),
+                    Some(next.start_time_millis),
+                    Some(self.clock.now_millis()),
+                    vec![("asset_count", TimingValue::from(next.asset_refs.len()))],
+                );
                 warn!(
                     step = 4,
                     generation,
@@ -183,6 +201,20 @@ impl PlaybackEngine {
             }
 
             // prepare 시작을 알린다 (실제 디코드/텍스처 업로드는 렌더 스레드).
+            let prepare_window_now = self.clock.now_millis();
+            timing_log::record(
+                "INFO",
+                1,
+                "PREPARE_WINDOW_ENTERED",
+                Some(&next.scene_id),
+                Some(next.start_time_millis),
+                Some(prepare_window_now),
+                vec![
+                    ("generation", TimingValue::from(generation)),
+                    ("asset_count", TimingValue::from(next.asset_refs.len())),
+                    ("is_video", TimingValue::from(next.has_video())),
+                ],
+            );
             info!(
                 step = 4,
                 generation,
@@ -219,6 +251,7 @@ impl PlaybackEngine {
 
             // step 6. 렌더 스레드로 전환 명령 발송. 수신자가 없으면 앱 종료로 보고 루프 탈출.
             self.set_state(EngineState::Ready).await;
+            let dispatch_now = self.clock.now_millis();
             let cmd = SwitchCommand {
                 scene: next.clone(),
                 target_time_millis: next.start_time_millis,
@@ -239,6 +272,15 @@ impl PlaybackEngine {
                 scene_id = %next.scene_id,
                 target_time_millis = next.start_time_millis,
                 "switch command dispatched"
+            );
+            timing_log::record(
+                "INFO",
+                3,
+                "SWITCH_COMMAND_DISPATCHED",
+                Some(&next.scene_id),
+                Some(next.start_time_millis),
+                Some(dispatch_now),
+                vec![("generation", TimingValue::from(generation))],
             );
             dispatched.insert(next.scene_id.clone(), next.end_time_millis);
 

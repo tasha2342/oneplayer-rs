@@ -13,8 +13,7 @@ use chrono::{Local, NaiveDate, NaiveTime};
 use chrono_tz::Tz;
 
 use crate::cms::{
-    FileDownloadDto, LayoutDto, PlaybackAssetDto, PlaybackDataDto, PlaybackItemDto,
-    PlaybackSlotDto,
+    FileDownloadDto, LayoutDto, PlaybackAssetDto, PlaybackDataDto, PlaybackItemDto, PlaybackSlotDto,
 };
 use crate::config::{
     DAY_MS, DEFAULT_ITEM_DURATION_SECONDS, DEFAULT_ZONE_ID, MAX_EXPANDED_SCENES, ONE_SECOND_MS,
@@ -125,8 +124,7 @@ impl TimelineBuilder {
         zone_id: Tz,
         now_millis: i64,
     ) -> Vec<PlaybackScene> {
-        let (slot_start_millis, slot_end_millis) =
-            Self::slot_time_range(slot, local_date, zone_id);
+        let (slot_start_millis, slot_end_millis) = Self::slot_time_range(slot, local_date, zone_id);
 
         // position 순으로 item을 정렬해 재생 순서를 고정한다.
         let mut items = slot.items.clone();
@@ -292,7 +290,11 @@ fn build_scene(
         item_id: item.id,
         start_time_millis: start_millis,
         end_time_millis: end_millis,
-        transition: item.transition.clone(),
+        transition: item.transition.clone().or_else(|| {
+            item.playback_data
+                .as_ref()
+                .and_then(|data| data.transition.clone())
+        }),
         loop_playback: item.loop_enabled(),
         // 미리 변환해 둔 공유 레이아웃을 참조한다 (복제 없음).
         layout: item
@@ -340,8 +342,18 @@ fn collect_asset_refs(
 fn item_duration_millis(item: &PlaybackItemDto) -> i64 {
     let positive = |v: i64| if v > 0 { Some(v) } else { None };
     let seconds = positive(item.duration_seconds)
-        .or_else(|| item.playback_data.as_ref().and_then(|p| p.duration).and_then(positive))
-        .or_else(|| item.layout.as_ref().and_then(|l| l.default_duration).and_then(positive))
+        .or_else(|| {
+            item.playback_data
+                .as_ref()
+                .and_then(|p| p.duration)
+                .and_then(positive)
+        })
+        .or_else(|| {
+            item.layout
+                .as_ref()
+                .and_then(|l| l.default_duration)
+                .and_then(positive)
+        })
         .unwrap_or(DEFAULT_ITEM_DURATION_SECONDS);
     seconds * ONE_SECOND_MS
 }
@@ -394,8 +406,7 @@ fn asset_to_ref(asset: &PlaybackAssetDto, timeline_revision: &str) -> AssetRef {
 /// video가 여러 개면 z_index가 가장 높은 것만 남긴다.
 /// 최종 요소 목록은 z_index 오름차순으로 정렬한다 (그리기 순서).
 fn layout_to_domain(dto: &LayoutDto) -> LayoutDefinition {
-    let mut elements: Vec<LayoutElement> =
-        dto.layout.iter().map(element_to_domain).collect();
+    let mut elements: Vec<LayoutElement> = dto.layout.iter().map(element_to_domain).collect();
 
     retain_single_video(&mut elements);
     elements.sort_by_key(|e| e.z_index.unwrap_or(0));

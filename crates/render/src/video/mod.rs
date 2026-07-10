@@ -30,6 +30,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
+/// 하드웨어 디코드 시도의 첫 프레임 대기 한도.
+///
+/// hwaccel 초기화 실패는 보통 수백 ms 안에 드러나므로 짧게 잡는다.
+/// 길게 잡으면 (T-8초 preroll 기준) 소프트웨어 폴백이 표출 시각을 넘겨
+/// 전환이 지연된다 (실측: 8초 대기 → delay 14초 사례).
+const HW_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 소프트웨어 디코드의 첫 프레임 대기 한도.
+const SW_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// 디코드된 영상 프레임 (RGBA, GPU 업로드용).
 #[derive(Debug, Clone)]
 pub struct VideoFrame {
@@ -166,6 +176,10 @@ pub struct FfmpegCliDecoder {
     ffprobe_exe: Option<PathBuf>,
     /// `none`/빈 문자열이면 CPU 디코딩.
     hwaccel: String,
+    /// 하드웨어 디코드 실패 학습 플래그 (pool 전체가 공유).
+    /// 한 번 실패하면 이후 모든 세션이 즉시 소프트웨어로 디코딩해
+    /// 디코더/scene마다 hw 시도 대기를 반복하지 않는다.
+    hw_disabled: Arc<AtomicBool>,
     path: Option<PathBuf>,
     target_width: u32,
     target_height: u32,
@@ -185,8 +199,17 @@ impl FfmpegCliDecoder {
         Self::with_hwaccel(default_hwaccel())
     }
 
-    /// hwaccel 방식을 지정해 디코더를 만든다.
+    /// hwaccel 방식을 지정해 디코더를 만든다 (hw 실패 플래그는 자체 소유).
     pub fn with_hwaccel(hwaccel: impl Into<String>) -> Result<Self> {
+        Self::with_shared_hw_flag(hwaccel, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// hwaccel 방식과 공유 hw 실패 플래그를 지정해 디코더를 만든다.
+    /// pool의 모든 디코더가 같은 플래그를 공유해 실패 학습을 전파한다.
+    pub fn with_shared_hw_flag(
+        hwaccel: impl Into<String>,
+        hw_disabled: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let ffmpeg_exe = find_ffmpeg_tool(ffmpeg_binary_name())
             .context("ffmpeg executable not found (checked ONEPLAYER_FFMPEG_DIR, exe dir, tools/ffmpeg, PATH)")?;
         let ffprobe_exe = find_ffmpeg_tool(ffprobe_binary_name());
@@ -200,6 +223,7 @@ impl FfmpegCliDecoder {
             ffmpeg_exe,
             ffprobe_exe,
             hwaccel,
+            hw_disabled,
             path: None,
             target_width: 0,
             target_height: 0,
@@ -211,6 +235,16 @@ impl FfmpegCliDecoder {
         })
     }
 
+    /// 실제 세션에 적용할 hwaccel 방식.
+    /// 공유 플래그에 실패가 기록되어 있으면 소프트웨어로 강제한다.
+    fn effective_hwaccel(&self) -> &str {
+        if self.hw_disabled.load(Ordering::SeqCst) {
+            ""
+        } else {
+            &self.hwaccel
+        }
+    }
+
     /// ffmpeg 프로세스를 스폰하고 리더 스레드를 시작한다.
     fn spawn_session(&mut self) -> Result<DecodeSession> {
         let path = self
@@ -218,10 +252,11 @@ impl FfmpegCliDecoder {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("video path not set"))?;
         let (w, h) = (self.target_width.max(2), self.target_height.max(2));
+        let hwaccel = self.effective_hwaccel().to_string();
 
         let mut cmd = Command::new(&self.ffmpeg_exe);
         cmd.args(["-hide_banner", "-loglevel", "error"]);
-        append_hwaccel_args(&mut cmd, &self.hwaccel);
+        append_hwaccel_args(&mut cmd, &hwaccel);
         if self.loop_playback {
             // 입력을 무한 반복한다. scene 종료 시 stop()으로 끊는다.
             cmd.args(["-stream_loop", "-1"]);
@@ -230,7 +265,7 @@ impl FfmpegCliDecoder {
             .arg(path)
             .args(["-an", "-sn"])
             .arg("-vf")
-            .arg(video_filter(&self.hwaccel, w, h))
+            .arg(video_filter(&hwaccel, w, h))
             .args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -286,7 +321,7 @@ impl FfmpegCliDecoder {
             });
         }
 
-        debug!(path = %path.display(), w, h, fps = self.fps, hwaccel = %self.hwaccel, "ffmpeg decode session started");
+        debug!(path = %path.display(), w, h, fps = self.fps, hwaccel = %hwaccel, "ffmpeg decode session started");
         Ok(DecodeSession {
             child,
             reader: Some(reader),
@@ -300,29 +335,35 @@ impl FfmpegCliDecoder {
     }
 
     /// hwaccel 실패 시 소프트웨어 디코딩으로 한 번 재시도한다.
+    ///
+    /// hw 시도는 짧은 대기 한도(3초)를 쓰고, 실패하면 공유 플래그에 기록해
+    /// 이후 모든 디코더/세션이 처음부터 소프트웨어로 디코딩한다
+    /// (scene마다 hw 실패 대기를 반복하면 정시 전환이 밀린다).
     fn spawn_with_fallback(&mut self) -> Result<()> {
-        let requested = self.hwaccel.clone();
-        match self.wait_for_first_frame() {
+        let requested = self.effective_hwaccel().to_string();
+        if !hwaccel_enabled(&requested) {
+            return self.wait_for_first_frame(SW_FIRST_FRAME_TIMEOUT);
+        }
+        match self.wait_for_first_frame(HW_FIRST_FRAME_TIMEOUT) {
             Ok(()) => Ok(()),
-            Err(err) if hwaccel_enabled(&requested) => {
+            Err(err) => {
                 warn!(
                     hwaccel = %requested,
                     error = %err,
-                    "hardware decode failed, falling back to software"
+                    "hardware decode failed, falling back to software (disabling hwaccel)"
                 );
-                self.hwaccel = String::new();
-                self.wait_for_first_frame()
+                self.hw_disabled.store(true, Ordering::SeqCst);
+                self.wait_for_first_frame(SW_FIRST_FRAME_TIMEOUT)
             }
-            Err(err) => Err(err),
         }
     }
 
     /// ffmpeg 세션을 시작하고 첫 프레임 준비를 기다린다.
-    fn wait_for_first_frame(&mut self) -> Result<()> {
+    fn wait_for_first_frame(&mut self, timeout: Duration) -> Result<()> {
         self.stop_session();
         let session = self.spawn_session()?;
         self.session = Some(session);
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + timeout;
         loop {
             let session = self.session.as_mut().expect("session");
             if session.first_frame_ready.load(Ordering::SeqCst) {
@@ -372,11 +413,7 @@ impl VideoDecoder for FfmpegCliDecoder {
     ) -> Result<()> {
         // 파일 없음(ENOENT)은 hwaccel과 무관한 실패이므로 여기서 조기에 걸러낸다.
         // (ffmpeg가 exit -2로 죽으면 하드웨어 디코드 실패로 오인돼 원인이 가려진다.)
-        anyhow::ensure!(
-            path.is_file(),
-            "video file not found: {}",
-            path.display()
-        );
+        anyhow::ensure!(path.is_file(), "video file not found: {}", path.display());
         self.stop_session();
         self.path = Some(path.to_path_buf());
         self.target_width = target_width;
@@ -563,7 +600,11 @@ fn probe_fps(ffprobe: &Path, video: &Path) -> Option<f64> {
 
     let output = cmd.output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
-    let line = text.lines().find(|l| !l.trim().is_empty())?.trim().to_string();
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())?
+        .trim()
+        .to_string();
     let fps = match line.split_once('/') {
         Some((num, den)) => {
             let num: f64 = num.trim().parse().ok()?;
@@ -645,7 +686,12 @@ fn find_ffmpeg_tool(name: &str) -> Option<PathBuf> {
 /// 사용 가능한 디코더 구현을 생성한다.
 /// ffmpeg 실행 파일이 있으면 [`FfmpegCliDecoder`], 없으면 스텁(검정 프레임).
 pub fn create_decoder(hwaccel: &str) -> Box<dyn VideoDecoder> {
-    match FfmpegCliDecoder::with_hwaccel(hwaccel) {
+    create_decoder_with_flag(hwaccel, Arc::new(AtomicBool::new(false)))
+}
+
+/// 공유 hw 실패 플래그를 지정해 디코더 구현을 생성한다.
+fn create_decoder_with_flag(hwaccel: &str, hw_disabled: Arc<AtomicBool>) -> Box<dyn VideoDecoder> {
+    match FfmpegCliDecoder::with_shared_hw_flag(hwaccel, hw_disabled) {
         Ok(decoder) => Box::new(decoder),
         Err(err) => {
             warn!("ffmpeg unavailable, falling back to stub video decoder: {err:#}");
@@ -660,30 +706,52 @@ pub fn create_decoder(hwaccel: &str) -> Box<dyn VideoDecoder> {
 /// (Android VideoPlayerPool 정책 — decoder churn과 OOM 방지).
 pub struct VideoDecoderPool {
     decoders: Vec<Arc<Mutex<Box<dyn VideoDecoder>>>>,
-    /// 다음에 빌려줄 slot 인덱스 (라운드 로빈).
-    next_index: std::sync::atomic::AtomicUsize,
+    hwaccel: String,
+    /// pool 전체가 공유하는 hw 디코드 실패 학습 플래그.
+    hw_disabled: Arc<AtomicBool>,
 }
 
 impl VideoDecoderPool {
     /// 지정 개수의 디코더 slot을 만든다 (최소 1).
     pub fn new(size: usize, hwaccel: impl Into<String>) -> Self {
         let hwaccel = normalize_hwaccel(hwaccel.into());
+        let hw_disabled = Arc::new(AtomicBool::new(false));
         let decoders = (0..size.max(1))
-            .map(|_| Arc::new(Mutex::new(create_decoder(&hwaccel))))
+            .map(|_| {
+                Arc::new(Mutex::new(create_decoder_with_flag(
+                    &hwaccel,
+                    hw_disabled.clone(),
+                )))
+            })
             .collect();
         Self {
             decoders,
-            next_index: std::sync::atomic::AtomicUsize::new(0),
+            hwaccel,
+            hw_disabled,
         }
     }
 
-    /// 라운드 로빈으로 디코더 slot을 빌려준다.
+    /// lease되지 않은 디코더 slot을 빌려준다.
+    ///
+    /// 예전 라운드 로빈 방식은 표출 중인 scene이 아직 쓰고 있는 slot을
+    /// 다시 빌려줄 수 있었다. 그 경우 prepare(open+preroll, 수 초)가
+    /// slot mutex를 오래 잡아 렌더 스레드의 프레임 갱신 lock과 충돌
+    /// (UI "응답 없음")하고, 재생 중인 ffmpeg 세션을 중단시켰다.
+    ///
+    /// 지금은 pool만 참조 중인(strong_count == 1) slot만 빌려주고,
+    /// 전부 사용 중이면 임시 디코더를 새로 만들어 반환한다
+    /// (표출 중인 영상을 뺏는 것보다 일시적 추가 프로세스가 낫다).
     pub fn acquire(&self) -> Arc<Mutex<Box<dyn VideoDecoder>>> {
-        let idx = self
-            .next_index
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            % self.decoders.len();
-        self.decoders[idx].clone()
+        for slot in &self.decoders {
+            if Arc::strong_count(slot) == 1 {
+                return slot.clone();
+            }
+        }
+        warn!("all pooled video decoders are leased, creating a temporary decoder");
+        Arc::new(Mutex::new(create_decoder_with_flag(
+            &self.hwaccel,
+            self.hw_disabled.clone(),
+        )))
     }
 }
 
@@ -765,7 +833,10 @@ mod hwaccel_tests {
     fn append_cuda_hwaccel_args() {
         let mut cmd = Command::new("ffmpeg");
         append_hwaccel_args(&mut cmd, "cuda");
-        let args: Vec<_> = cmd.get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
         assert!(args.windows(2).any(|w| w == ["-hwaccel", "cuda"]));
     }
 }

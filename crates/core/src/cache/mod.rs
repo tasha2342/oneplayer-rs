@@ -244,9 +244,7 @@ fn resolve_url(base_url: &str, download_url: &str) -> String {
 /// `cms_base_url`에서 호스트 origin만 추출한다 (`.../api` 접미사 제거).
 fn cms_origin(base_url: &str) -> &str {
     let trimmed = base_url.trim_end_matches('/');
-    trimmed
-        .strip_suffix("/api")
-        .unwrap_or(trimmed)
+    trimmed.strip_suffix("/api").unwrap_or(trimmed)
 }
 
 #[cfg(test)]
@@ -267,10 +265,7 @@ mod tests {
     #[test]
     fn resolve_relative_download_url() {
         assert_eq!(
-            resolve_url(
-                "https://kn.jdone.co.kr/api",
-                "v1/content-files/38/file"
-            ),
+            resolve_url("https://kn.jdone.co.kr/api", "v1/content-files/38/file"),
             "https://kn.jdone.co.kr/api/v1/content-files/38/file"
         );
     }
@@ -288,7 +283,13 @@ mod tests {
 
     #[test]
     fn cms_origin_strips_api_suffix() {
-        assert_eq!(cms_origin("https://kn.jdone.co.kr/api"), "https://kn.jdone.co.kr");
-        assert_eq!(cms_origin("https://kn.jdone.co.kr"), "https://kn.jdone.co.kr");
+        assert_eq!(
+            cms_origin("https://kn.jdone.co.kr/api"),
+            "https://kn.jdone.co.kr"
+        );
+        assert_eq!(
+            cms_origin("https://kn.jdone.co.kr"),
+            "https://kn.jdone.co.kr"
+        );
     }
 }

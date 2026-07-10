@@ -37,13 +37,45 @@ pub(super) fn quad_vertices(
     let y0 = 1.0 - (y / ch) * 2.0; // 요소 상단.
     let y1 = 1.0 - ((y + height) / ch) * 2.0; // 요소 하단.
     [
-        Vertex { position: [x0, y1], tex_coords: [0.0, 1.0] },
-        Vertex { position: [x1, y1], tex_coords: [1.0, 1.0] },
-        Vertex { position: [x1, y0], tex_coords: [1.0, 0.0] },
-        Vertex { position: [x0, y1], tex_coords: [0.0, 1.0] },
-        Vertex { position: [x1, y0], tex_coords: [1.0, 0.0] },
-        Vertex { position: [x0, y0], tex_coords: [0.0, 0.0] },
+        Vertex {
+            position: [x0, y1],
+            tex_coords: [0.0, 1.0],
+        },
+        Vertex {
+            position: [x1, y1],
+            tex_coords: [1.0, 1.0],
+        },
+        Vertex {
+            position: [x1, y0],
+            tex_coords: [1.0, 0.0],
+        },
+        Vertex {
+            position: [x0, y1],
+            tex_coords: [0.0, 1.0],
+        },
+        Vertex {
+            position: [x1, y0],
+            tex_coords: [1.0, 0.0],
+        },
+        Vertex {
+            position: [x0, y0],
+            tex_coords: [0.0, 0.0],
+        },
     ]
+}
+
+/// 기존 quad를 NDC 좌표계 오프셋만큼 이동한 정점 배열을 만든다.
+pub(super) fn translated_vertices(
+    vertices: &[Vertex; 6],
+    offset_x: f32,
+    offset_y: f32,
+) -> [Vertex; 6] {
+    let mut translated = *vertices;
+    for vertex in &mut translated {
+        vertex.position[0] += offset_x;
+        vertex.position[1] += offset_y;
+    }
+    translated
 }
 
 /// wgpu 디바이스/서피스/파이프라인을 묶은 GPU 컨텍스트.
@@ -124,13 +156,19 @@ impl GpuContext {
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("element_quad"),
                 contents: bytemuck::cast_slice(vertices),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             })
     }
 
     /// 기존 텍스처의 픽셀 데이터를 교체한다 (영상 프레임 갱신용).
     /// 크기는 텍스처 생성 시와 동일해야 한다.
-    pub fn update_rgba_texture(&self, texture: &wgpu::Texture, width: u32, height: u32, rgba: &[u8]) {
+    pub fn update_rgba_texture(
+        &self,
+        texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) {
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture,
