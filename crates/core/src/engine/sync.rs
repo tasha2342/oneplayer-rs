@@ -131,6 +131,7 @@ impl PlaybackEngine {
             *self.active_timeline.lock().await = Some(timeline.clone());
             *self.last_revision.lock().await = Some(timeline.revision.clone());
         }
+        self.refresh_playback_log_scenes(timeline);
         let _ = self.events.send(EngineEvent::TimelineUpdated {
             revision: timeline.revision.clone(),
             scene_count: timeline.scenes.len(),
@@ -163,6 +164,7 @@ impl PlaybackEngine {
             *self.active_timeline.lock().await = Some(timeline.clone());
             *self.last_revision.lock().await = Some(timeline.revision.clone());
         }
+        self.refresh_playback_log_scenes(&timeline);
         let _ = self
             .events
             .send(EngineEvent::Status("cached playback loaded".into()));

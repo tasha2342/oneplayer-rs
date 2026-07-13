@@ -116,9 +116,15 @@ impl AppSettings {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read config: {}", path.display()))?;
-        let settings: Self = toml::from_str(&raw).context("failed to parse config.toml")?;
+        let mut settings: Self = toml::from_str(&raw).context("failed to parse config.toml")?;
+        settings.apply_env_overrides();
         settings.validate()?;
         Ok(settings)
+    }
+
+    /// 환경변수 기반 런타임 override를 적용한다.
+    pub fn apply_env_overrides(&mut self) {
+        self.apply_device_id_override(std::env::var("ONEPLAYER_DEVICE_ID").ok());
     }
 
     /// 설정을 TOML 파일로 저장한다 (최초 실행 시 기본 config 생성용).
@@ -140,6 +146,15 @@ impl AppSettings {
         );
         anyhow::ensure!(!self.ntp_server.trim().is_empty(), "ntp_server is required");
         Ok(())
+    }
+
+    fn apply_device_id_override(&mut self, value: Option<String>) {
+        if let Some(device_id) = value
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            self.device_id = device_id;
+        }
     }
 
     /// 데이터 저장 루트 디렉터리를 결정한다.
@@ -213,5 +228,20 @@ mod tests {
     #[test]
     fn default_settings_validate() {
         AppSettings::default().validate().unwrap();
+    }
+
+    #[test]
+    fn device_id_env_override_uses_non_empty_value() {
+        let mut settings = AppSettings::default();
+        settings.apply_device_id_override(Some(" DEVICE-ENV ".into()));
+        assert_eq!(settings.device_id, "DEVICE-ENV");
+    }
+
+    #[test]
+    fn device_id_env_override_ignores_blank_value() {
+        let mut settings = AppSettings::default();
+        let original = settings.device_id.clone();
+        settings.apply_device_id_override(Some("  ".into()));
+        assert_eq!(settings.device_id, original);
     }
 }

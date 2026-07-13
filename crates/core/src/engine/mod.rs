@@ -11,11 +11,13 @@
 //! [`PlaybackEngine::on_scene_switched`] / [`PlaybackEngine::on_switch_failed`]로 회신된다.
 
 mod playback;
+mod playback_log;
 mod state;
 mod sync;
 
 pub use state::{EngineEvent, EngineState, SwitchCommand};
 
+use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -29,6 +31,8 @@ use crate::clock::SignageClock;
 use crate::cms::CmsApiClient;
 use crate::settings::AppSettings;
 use crate::timeline::PlaybackTimeline;
+
+use self::playback_log::{ActivePlaybackLog, PlaybackLogReporter, PlaybackLogScene};
 
 /// 사이니지 재생 엔진.
 ///
@@ -53,6 +57,12 @@ pub struct PlaybackEngine {
     /// 재생 루프가 "지금 표출 중이어야 할 scene"과 비교해 누락을 복구한다.
     /// 동기 콜백에서 갱신되므로 std Mutex를 사용한다.
     pub(crate) last_switched_scene: Arc<StdMutex<Option<String>>>,
+    /// scene_id → 재생 로그용 메타데이터 인덱스.
+    pub(crate) playback_log_scenes: Arc<StdMutex<HashMap<String, PlaybackLogScene>>>,
+    /// 현재 표출 중인 scene의 재생 로그 상태.
+    pub(crate) active_playback_log: Arc<StdMutex<Option<ActivePlaybackLog>>>,
+    /// 완료된 재생 로그를 배치 전송하는 큐.
+    pub(crate) playback_log_reporter: PlaybackLogReporter,
     /// 진단/UI용 이벤트 발신 채널.
     pub(crate) events: mpsc::UnboundedSender<EngineEvent>,
     /// 렌더 스레드로 보내는 전환 명령 채널.
@@ -80,6 +90,9 @@ impl PlaybackEngine {
             active_timeline: Arc::new(Mutex::new(None)),
             last_revision: Arc::new(Mutex::new(None)),
             last_switched_scene: Arc::new(StdMutex::new(None)),
+            playback_log_scenes: Arc::new(StdMutex::new(HashMap::new())),
+            active_playback_log: Arc::new(StdMutex::new(None)),
+            playback_log_reporter: PlaybackLogReporter::new(),
             events,
             switch_tx,
             playback_generation: Arc::new(AtomicU64::new(0)),
@@ -92,6 +105,8 @@ impl PlaybackEngine {
     /// 2. 주기 동기화 루프 시작 (NTP + CMS revision 폴링)
     /// 3. 5분 주기 캐시 정리 루프 시작
     pub async fn start(self: Arc<Self>) {
+        self.playback_log_reporter.start(self.cms.clone());
+
         // 캐시 재생 시도 후 동기화 루프 진입.
         let engine = self.clone();
         tokio::spawn(async move {

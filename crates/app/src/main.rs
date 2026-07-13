@@ -40,7 +40,8 @@ fn load_settings() -> AppSettings {
     let path = config_path();
     AppSettings::load(&path).unwrap_or_else(|err| {
         eprintln!("config load failed ({err:#}), using defaults");
-        let default = AppSettings::default();
+        let mut default = AppSettings::default();
+        default.apply_env_overrides();
         if !path.exists() {
             let _ = default.save(&path);
         }

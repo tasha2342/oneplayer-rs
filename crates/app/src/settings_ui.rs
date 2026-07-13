@@ -5,8 +5,8 @@
 
 use egui_wgpu::ScreenDescriptor;
 use egui_winit::egui::{
-    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, RichText, Stroke,
-    Vec2,
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, RichText, Sense,
+    Stroke, TextureHandle, Vec2,
 };
 use oneplayer_core::settings::AppSettings;
 use wgpu::{CommandEncoder, Device, Queue, TextureFormat, TextureView};
@@ -37,6 +37,7 @@ pub struct SettingsUi {
     draft_canvas_height: String,
     draft_settings_button_transparent: bool,
     status_message: Option<String>,
+    settings_icon: Option<TextureHandle>,
     last_paint_jobs: Vec<egui::ClippedPrimitive>,
     last_textures_delta: egui::TexturesDelta,
     pointer_active: bool,
@@ -49,6 +50,7 @@ impl SettingsUi {
         configure_fonts(&egui_ctx);
         configure_theme(&egui_ctx);
 
+        let settings_icon = load_settings_icon(&egui_ctx);
         let viewport_id = egui_ctx.viewport_id();
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -72,6 +74,7 @@ impl SettingsUi {
             draft_canvas_height: String::new(),
             draft_settings_button_transparent: false,
             status_message: None,
+            settings_icon,
             last_paint_jobs: Vec::new(),
             last_textures_delta: egui::TexturesDelta::default(),
             pointer_active: false,
@@ -118,6 +121,7 @@ impl SettingsUi {
             let draft_canvas_height = &mut self.draft_canvas_height;
             let draft_settings_button_transparent = &mut self.draft_settings_button_transparent;
             let status_message = &mut self.status_message;
+            let settings_icon = self.settings_icon.as_ref();
 
             egui_ctx.run(raw_input, |ctx| {
                 action = draw_ui(
@@ -131,6 +135,7 @@ impl SettingsUi {
                     draft_canvas_height,
                     draft_settings_button_transparent,
                     status_message,
+                    settings_icon,
                 );
             })
         };
@@ -211,6 +216,7 @@ fn draw_ui(
     draft_canvas_height: &mut String,
     draft_settings_button_transparent: &mut bool,
     status_message: &mut Option<String>,
+    settings_icon: Option<&TextureHandle>,
 ) -> SettingsAction {
     if !*panel_open {
         draw_settings_button(
@@ -224,6 +230,7 @@ fn draw_ui(
             draft_canvas_height,
             draft_settings_button_transparent,
             status_message,
+            settings_icon,
         );
         return SettingsAction::None;
     }
@@ -365,6 +372,7 @@ fn draw_settings_button(
     draft_canvas_height: &mut String,
     draft_settings_button_transparent: &mut bool,
     status_message: &mut Option<String>,
+    settings_icon: Option<&TextureHandle>,
 ) {
     let button_size = 52.0;
     let margin = 16.0;
@@ -387,17 +395,22 @@ fn draw_settings_button(
                 Stroke::NONE
             };
 
-            let button = egui::Button::new(
-                RichText::new(if visible { "⚙" } else { " " })
-                    .size(22.0)
-                    .color(Color32::WHITE),
-            )
-            .fill(fill)
-            .stroke(stroke)
-            .corner_radius(CornerRadius::same(26))
-            .min_size(Vec2::splat(button_size));
+            let (rect, response) = ui.allocate_exact_size(Vec2::splat(button_size), Sense::click());
+            if visible {
+                ui.painter()
+                    .circle(rect.center(), button_size * 0.5, fill, stroke);
+                if let Some(icon) = settings_icon {
+                    let icon_rect = rect.shrink(7.0);
+                    ui.painter().image(
+                        icon.id(),
+                        icon_rect,
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
+            }
 
-            if ui.add(button).clicked() {
+            if response.clicked() {
                 *panel_open = true;
                 *status_message = None;
                 sync_draft_from_settings(
@@ -411,6 +424,24 @@ fn draw_settings_button(
                 );
             }
         });
+}
+
+fn load_settings_icon(ctx: &egui::Context) -> Option<TextureHandle> {
+    let bytes = include_bytes!("../../../favicon.png");
+    let image = match image::load_from_memory(bytes) {
+        Ok(image) => image.to_rgba8(),
+        Err(err) => {
+            tracing::warn!(%err, "failed to decode settings favicon");
+            return None;
+        }
+    };
+    let size = [image.width() as usize, image.height() as usize];
+    let pixels = image.into_raw();
+    Some(ctx.load_texture(
+        "settings_favicon",
+        egui::ColorImage::from_rgba_unmultiplied(size, &pixels),
+        egui::TextureOptions::LINEAR,
+    ))
 }
 
 fn sync_draft_from_settings(

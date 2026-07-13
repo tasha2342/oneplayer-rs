@@ -5,6 +5,7 @@
 //! - 목표 시각(T)에는 레이어 표시 상태만 바꾼다 (무거운 작업 금지)
 //! - `transition = "slide"` 계열이면 짧은 시간 동안 두 레이어의 quad 위치만
 //!   이동해 슬라이드 효과를 만든다
+//! - `transition = "fade"` 계열이면 두 레이어의 opacity만 조절해 페이드 효과를 만든다
 //! - T-1초부터는 매 렌더 프레임([`DoubleBufferCompositor::tick`])마다
 //!   보정 시각을 검사해 첫 도달 프레임에서 전환한다
 //! - 영상 scene은 첫 프레임 준비 신호를 기다리되 최대 2초까지만 유예한다
@@ -25,10 +26,10 @@ use winit::window::Window;
 
 use crate::scene::PreparedScene;
 
-use gpu::{parse_hex_color, quad_vertices, translated_vertices, GpuContext, Vertex};
+use gpu::{parse_hex_color, quad_vertices, transformed_vertices, GpuContext, Vertex};
 
 /// 기본 슬라이드 전환 길이.
-const SLIDE_TRANSITION_DURATION_MS: i64 = 400;
+const TRANSITION_DURATION_MS: i64 = 400;
 
 /// 레이어 전환 결과. `delay_millis = actual - target` (목표 ±100ms).
 #[derive(Debug, Clone)]
@@ -107,6 +108,24 @@ struct SlideTransition {
     direction: f32,
 }
 
+/// 진행 중인 페이드 전환 정보.
+struct FadeTransition {
+    /// 새 scene이 올라간 레이어.
+    incoming: usize,
+    /// 이전 scene이 남아 있는 레이어.
+    outgoing: usize,
+    /// 전환 시작 시각 (SignageClock 기준 epoch millis).
+    started_at_millis: i64,
+    /// 전환 길이.
+    duration_millis: i64,
+    /// 전환 목표 시각.
+    target_time_millis: i64,
+    /// 새 scene ID.
+    scene_id: String,
+    /// 새 scene 영상 포함 여부.
+    is_video: bool,
+}
+
 /// 더블버퍼 컴포지터 본체.
 pub struct DoubleBufferCompositor {
     /// GPU 컨텍스트 (surface/device/pipeline).
@@ -119,6 +138,8 @@ pub struct DoubleBufferCompositor {
     pending_switch: Option<PendingSwitch>,
     /// 진행 중인 슬라이드 전환 (없으면 None).
     slide_transition: Option<SlideTransition>,
+    /// 진행 중인 페이드 전환 (없으면 None).
+    fade_transition: Option<FadeTransition>,
     /// 보정 시각 공급자 (SignageClock::now_millis를 주입받는다).
     now_millis: Box<dyn Fn() -> i64 + Send + Sync>,
 }
@@ -140,6 +161,7 @@ impl DoubleBufferCompositor {
             active: 0,
             pending_switch: None,
             slide_transition: None,
+            fade_transition: None,
             now_millis,
         })
     }
@@ -195,11 +217,29 @@ impl DoubleBufferCompositor {
                     incoming: hidden,
                     outgoing: self.active,
                     started_at_millis: actual,
-                    duration_millis: SLIDE_TRANSITION_DURATION_MS,
+                    duration_millis: TRANSITION_DURATION_MS,
                     target_time_millis: target,
                     scene_id: scene_id.clone(),
                     is_video,
                     direction,
+                });
+            } else {
+                self.layers[hidden].alpha = 1.0;
+                self.layers[self.active].alpha = 0.0;
+                self.active = hidden;
+            }
+        } else if is_fade_transition(transition.as_deref()) {
+            if self.layers[self.active].scene.is_some() {
+                self.layers[hidden].alpha = 0.0;
+                self.layers[self.active].alpha = 1.0;
+                self.fade_transition = Some(FadeTransition {
+                    incoming: hidden,
+                    outgoing: self.active,
+                    started_at_millis: actual,
+                    duration_millis: TRANSITION_DURATION_MS,
+                    target_time_millis: target,
+                    scene_id: scene_id.clone(),
+                    is_video,
                 });
             } else {
                 self.layers[hidden].alpha = 1.0;
@@ -248,6 +288,7 @@ impl DoubleBufferCompositor {
                     "is_slide",
                     TimingValue::from(self.slide_transition.is_some()),
                 ),
+                ("is_fade", TimingValue::from(self.fade_transition.is_some())),
             ],
         );
         Some(result)
@@ -262,6 +303,7 @@ impl DoubleBufferCompositor {
     /// 4. 영상 scene인데 첫 프레임 미준비 → 최대 2초까지 현재 화면 유지 후 강제 전환
     pub fn tick(&mut self) -> Option<SwitchResult> {
         self.finish_slide_if_complete();
+        self.finish_fade_if_complete();
 
         let pending = self.pending_switch.as_ref()?;
         let now = (self.now_millis)();
@@ -345,7 +387,7 @@ impl DoubleBufferCompositor {
     {
         // 렌더 패스 전에 보이는 레이어의 영상 프레임을 갱신한다.
         self.update_video_frames();
-        self.update_vertex_offsets();
+        self.update_layer_vertices();
 
         let output = self.gpu.surface.get_current_texture()?;
         let view = output
@@ -496,8 +538,43 @@ impl DoubleBufferCompositor {
         );
     }
 
-    /// 현재 전환 상태에 맞게 각 레이어의 quad 정점 버퍼에 슬라이드 오프셋을 반영한다.
-    fn update_vertex_offsets(&mut self) {
+    /// 페이드가 완료되었으면 새 레이어를 active로 확정하고 이전 레이어를 해제한다.
+    fn finish_fade_if_complete(&mut self) {
+        let Some(transition) = self.fade_transition.as_ref() else {
+            return;
+        };
+        let now = (self.now_millis)();
+        if now < transition.started_at_millis + transition.duration_millis {
+            return;
+        }
+
+        let incoming = transition.incoming;
+        let outgoing = transition.outgoing;
+        let scene_id = transition.scene_id.clone();
+        let target = transition.target_time_millis;
+        let is_video = transition.is_video;
+
+        self.layers[incoming].alpha = 1.0;
+        self.layers[outgoing].alpha = 0.0;
+        release_layer_decoder(&mut self.layers[outgoing]);
+        self.active = incoming;
+        self.fade_transition = None;
+        self.reset_layer_vertex_transform(incoming);
+        self.reset_layer_vertex_transform(outgoing);
+
+        timing_log::record(
+            "INFO",
+            15,
+            "FADE_TRANSITION_FINISHED",
+            Some(&scene_id),
+            Some(target),
+            Some(now),
+            vec![("is_video", TimingValue::from(is_video))],
+        );
+    }
+
+    /// 현재 전환 상태에 맞게 각 레이어의 quad 정점 버퍼에 위치와 opacity를 반영한다.
+    fn update_layer_vertices(&mut self) {
         if let Some(transition) = &self.slide_transition {
             let now = (self.now_millis)();
             let elapsed = now - transition.started_at_millis;
@@ -508,21 +585,42 @@ impl DoubleBufferCompositor {
             let direction = transition.direction;
             let incoming_offset = direction * travel * (1.0 - progress);
             let outgoing_offset = -direction * travel * progress;
-            self.write_layer_vertex_offset(incoming, incoming_offset);
-            self.write_layer_vertex_offset(outgoing, outgoing_offset);
+            self.write_layer_vertex_transform(incoming, incoming_offset, 1.0);
+            self.write_layer_vertex_transform(outgoing, outgoing_offset, 1.0);
             return;
         }
 
-        self.reset_layer_vertex_offset(self.active);
+        if let Some(transition) = &self.fade_transition {
+            let now = (self.now_millis)();
+            let elapsed = now - transition.started_at_millis;
+            let progress = (elapsed as f32 / transition.duration_millis as f32).clamp(0.0, 1.0);
+            let incoming = transition.incoming;
+            let outgoing = transition.outgoing;
+            // 기존 알파 블렌딩에서 두 레이어를 반투명으로 겹치면 중간 프레임이
+            // 과하게 어두워진다. 페이드는 검정 배경을 사이에 둔 out/in으로 처리한다.
+            let outgoing_alpha = (1.0 - progress * 2.0).clamp(0.0, 1.0);
+            let incoming_alpha = ((progress - 0.5) * 2.0).clamp(0.0, 1.0);
+            self.layers[incoming].alpha = incoming_alpha;
+            self.layers[outgoing].alpha = outgoing_alpha;
+            self.write_layer_vertex_transform(incoming, 0.0, incoming_alpha);
+            self.write_layer_vertex_transform(outgoing, 0.0, outgoing_alpha);
+            return;
+        }
+
+        self.reset_layer_vertex_transform(self.active);
     }
 
     fn reset_layer_vertex_offset(&mut self, layer_index: usize) {
-        self.write_layer_vertex_offset(layer_index, 0.0);
+        self.write_layer_vertex_transform(layer_index, 0.0, 1.0);
     }
 
-    fn write_layer_vertex_offset(&mut self, layer_index: usize, offset_x: f32) {
+    fn reset_layer_vertex_transform(&mut self, layer_index: usize) {
+        self.write_layer_vertex_transform(layer_index, 0.0, 1.0);
+    }
+
+    fn write_layer_vertex_transform(&mut self, layer_index: usize, offset_x: f32, opacity: f32) {
         for draw in &self.layers[layer_index].draws {
-            let vertices = translated_vertices(&draw.base_vertices, offset_x, 0.0);
+            let vertices = transformed_vertices(&draw.base_vertices, offset_x, 0.0, opacity);
             self.gpu
                 .queue
                 .write_buffer(&draw.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
@@ -532,6 +630,8 @@ impl DoubleBufferCompositor {
     /// 슬라이드 중에는 이전 레이어를 먼저, 새 레이어를 나중에 그린다.
     fn render_order(&self) -> [usize; 2] {
         if let Some(transition) = &self.slide_transition {
+            [transition.outgoing, transition.incoming]
+        } else if let Some(transition) = &self.fade_transition {
             [transition.outgoing, transition.incoming]
         } else {
             [0, 1]
@@ -646,4 +746,11 @@ fn slide_direction(transition: Option<&str>) -> Option<f32> {
     } else {
         Some(1.0)
     }
+}
+
+/// CMS transition 문자열이 페이드 전환인지 확인한다.
+fn is_fade_transition(transition: Option<&str>) -> bool {
+    transition
+        .map(|value| value.to_ascii_lowercase().contains("fade"))
+        .unwrap_or(false)
 }

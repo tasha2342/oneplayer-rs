@@ -1,11 +1,13 @@
 struct VertexInput {
     @location(0) position: vec2<f32>,
     @location(1) tex_coords: vec2<f32>,
+    @location(2) opacity: f32,
 }
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) tex_coords: vec2<f32>,
+    @location(1) opacity: f32,
 }
 
 @vertex
@@ -13,6 +15,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     out.clip_position = vec4<f32>(input.position, 0.0, 1.0);
     out.tex_coords = input.tex_coords;
+    out.opacity = input.opacity;
     return out;
 }
 
@@ -23,5 +26,6 @@ var s_diffuse: sampler;
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(t_diffuse, s_diffuse, input.tex_coords);
+    let color = textureSample(t_diffuse, s_diffuse, input.tex_coords);
+    return vec4<f32>(color.rgb, color.a * input.opacity);
 }

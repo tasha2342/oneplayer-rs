@@ -2,7 +2,7 @@
 //!
 //! 정책 (OnePlayer 0.4.0 계승):
 //! - scene prepare window: 12초 (T-12초에 준비 시작)
-//! - 영상 preroll window: 8초 (T-8초에 preroll 시작)
+//! - 영상 preroll은 prepare와 함께 시작해 느린 ffmpeg open/first-frame 비용을 흡수
 //! - 표출 시점 다운로드 금지 — 에셋 미준비 scene은 전환하지 않고 재시도
 //! - 실제 정밀 전환(T-1초 이후 frame loop)은 렌더 스레드가 담당
 //!
@@ -13,9 +13,8 @@
 //!    이후 다음 scene 선정 — 없으면 5초 후 재시도
 //! 3. T-12초(prepare window) 전이면 그 시각까지 대기
 //! 4. 에셋 준비 확인 — 미준비면 5초 후 재시도
-//! 5. 영상 scene이면 T-8초(preroll window)까지 대기
-//! 6. 렌더 스레드에 전환 명령 발송
-//! 7. 다음 scene의 prepare window까지 대기
+//! 5. 렌더 스레드에 전환 명령 발송 (영상 open + preroll도 여기서 시작)
+//! 6. 다음 scene의 prepare window까지 대기
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -28,7 +27,7 @@ use tracing::{debug, info, warn};
 use crate::clock::Clock;
 use crate::config::{
     FILE_CACHE_WARM_WINDOW_MS, MIN_PLAYBACK_LOOP_DELAY_MS, NO_SCENE_RETRY_MS, PRECISE_WINDOW_MS,
-    SCENE_PREPARE_WINDOW_MS, VIDEO_FIRST_FRAME_WAIT_MS, VIDEO_PREROLL_WINDOW_MS,
+    SCENE_PREPARE_WINDOW_MS, VIDEO_FIRST_FRAME_WAIT_MS,
 };
 use crate::timeline::{PlaybackScene, PlaybackTimeline};
 use crate::timing_log::{self, TimingValue};
@@ -74,6 +73,7 @@ impl PlaybackEngine {
             }
 
             let now = self.clock.now_millis();
+            self.close_expired_playback_log(now);
             dispatched.retain(|_, end_time| *end_time > now);
 
             // step 2. 복구 경로: 지금 표출 중이어야 할 scene이 화면과 다르면
@@ -231,25 +231,8 @@ impl PlaybackEngine {
                 target_time_millis: next.start_time_millis,
             });
 
-            // step 5. 영상 scene은 preroll window(T-8초)에 맞춰 전환 명령을 보낸다.
-            if next.has_video() {
-                let preroll_at = next.start_time_millis - VIDEO_PREROLL_WINDOW_MS;
-                let now = self.clock.now_millis();
-                if now < preroll_at {
-                    let delay_ms = (preroll_at - now).max(MIN_PLAYBACK_LOOP_DELAY_MS);
-                    debug!(
-                        step = 5,
-                        generation,
-                        scene_id = %next.scene_id,
-                        preroll_at_millis = preroll_at,
-                        sleep_ms = delay_ms,
-                        "waiting for video preroll window"
-                    );
-                    sleep_ms(delay_ms).await;
-                }
-            }
-
-            // step 6. 렌더 스레드로 전환 명령 발송. 수신자가 없으면 앱 종료로 보고 루프 탈출.
+            // step 5. 렌더 스레드로 전환 명령 발송. 수신자가 없으면 앱 종료로 보고 루프 탈출.
+            // 영상 scene도 prepare window(T-12초)에 바로 보내 open + preroll을 시작한다.
             self.set_state(EngineState::Ready).await;
             let dispatch_now = self.clock.now_millis();
             let cmd = SwitchCommand {
@@ -259,7 +242,7 @@ impl PlaybackEngine {
             };
             if self.switch_tx.send(cmd).is_err() {
                 warn!(
-                    step = 6,
+                    step = 5,
                     generation,
                     scene_id = %next.scene_id,
                     "switch command channel closed, stopping playback loop"
@@ -267,7 +250,7 @@ impl PlaybackEngine {
                 break;
             }
             info!(
-                step = 6,
+                step = 5,
                 generation,
                 scene_id = %next.scene_id,
                 target_time_millis = next.start_time_millis,
@@ -284,7 +267,7 @@ impl PlaybackEngine {
             );
             dispatched.insert(next.scene_id.clone(), next.end_time_millis);
 
-            // step 7. 현재 scene 표출이 끝날 때까지 기다리지 않고,
+            // step 6. 현재 scene 표출이 끝날 때까지 기다리지 않고,
             //    바로 다음 scene의 prepare window까지 대기한다.
             //    (복구 경로가 주기적으로 동작하도록 대기는 재시도 간격으로 상한 처리)
             let wake_at = next_wake_at(&timeline, next, self.clock.now_millis());
@@ -294,7 +277,7 @@ impl PlaybackEngine {
                     .max(MIN_PLAYBACK_LOOP_DELAY_MS)
                     .min(NO_SCENE_RETRY_MS);
                 debug!(
-                    step = 7,
+                    step = 6,
                     generation,
                     scene_id = %next.scene_id,
                     wake_at_millis = wake_at,
@@ -375,6 +358,9 @@ impl PlaybackEngine {
         target_time_millis: i64,
         actual_time_millis: i64,
     ) {
+        self.finish_active_playback_log(actual_time_millis, true);
+        self.start_playback_log(scene_id, actual_time_millis);
+
         // 재생 루프의 복구 판단(step 2)에 쓰이는 "화면에 표출된 scene" 기록.
         if let Ok(mut last) = self.last_switched_scene.lock() {
             *last = Some(scene_id.to_string());
@@ -404,6 +390,87 @@ impl PlaybackEngine {
             scene_id: scene_id.to_string(),
             reason: reason.to_string(),
         });
+    }
+
+    /// 새 타임라인의 scene 로그 인덱스를 반영한다.
+    pub(crate) fn refresh_playback_log_scenes(&self, timeline: &PlaybackTimeline) {
+        let scenes: HashMap<_, _> = timeline
+            .scenes
+            .iter()
+            .filter_map(|scene| {
+                let log_scene = super::playback_log::PlaybackLogScene::from_scene(scene)?;
+                Some((log_scene.scene_id.clone(), log_scene))
+            })
+            .collect();
+
+        let active_missing = self
+            .active_playback_log
+            .lock()
+            .ok()
+            .and_then(|active| {
+                active
+                    .as_ref()
+                    .map(|active| !scenes.contains_key(active.scene_id()))
+            })
+            .unwrap_or(false);
+        if active_missing {
+            self.finish_active_playback_log(self.clock.now_millis(), false);
+        }
+
+        if let Ok(mut guard) = self.playback_log_scenes.lock() {
+            *guard = scenes;
+        } else {
+            warn!("playback log scene index lock poisoned");
+        }
+    }
+
+    fn start_playback_log(&self, scene_id: &str, started_at_millis: i64) {
+        let scene = self
+            .playback_log_scenes
+            .lock()
+            .ok()
+            .and_then(|scenes| scenes.get(scene_id).cloned());
+        let Some(scene) = scene else {
+            warn!(scene_id, "playback log scene metadata missing");
+            return;
+        };
+
+        if let Ok(mut active) = self.active_playback_log.lock() {
+            *active = Some(super::playback_log::ActivePlaybackLog::new(
+                scene,
+                started_at_millis,
+            ));
+        } else {
+            warn!("active playback log lock poisoned");
+        }
+    }
+
+    fn close_expired_playback_log(&self, now_millis: i64) {
+        let ended_at = self.active_playback_log.lock().ok().and_then(|active| {
+            active
+                .as_ref()
+                .filter(|active| now_millis >= active.end_time_millis())
+                .map(|active| active.end_time_millis())
+        });
+        if let Some(ended_at) = ended_at {
+            self.finish_active_playback_log(ended_at, true);
+        }
+    }
+
+    fn finish_active_playback_log(&self, ended_at_millis: i64, completed: bool) {
+        let active = self
+            .active_playback_log
+            .lock()
+            .ok()
+            .and_then(|mut active| active.take());
+        let Some(active) = active else {
+            return;
+        };
+
+        match active.into_item(&self.settings.device_id, ended_at_millis, completed) {
+            Some(item) => self.playback_log_reporter.record(item),
+            None => warn!("failed to format playback log timestamps"),
+        }
     }
 
     /// 보호 대상(현재/다음/warm window 20분 내 scene의 에셋)을 제외하고

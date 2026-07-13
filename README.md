@@ -63,6 +63,18 @@ crates/app      winit event loop, 설정, 로깅, Windows 절전 방지
 | canvas | 1080 x 1920 |
 | fullscreen | true |
 
+`ONEPLAYER_DEVICE_ID` 환경변수가 있으면 `config.toml`의 `device_id`보다 우선합니다.
+
+## 재생 로그
+
+레이아웃이 실제 화면에 표출되고 종료되면 CMS로 재생 로그를 전송합니다. 요청 부하를 줄이기 위해 단건 API가 아니라 `/api/v1/playback-logs/batch`에 배치로 보냅니다.
+
+- `content_type`: `layout`
+- `content_id`: 실행된 `layout.id`
+- `started_at`, `ended_at`: UTC ISO 8601 문자열
+- `completed`: 정상 종료 시 `true`, 타임라인 교체 등으로 중단되면 `false`
+- `extra`: `scene_id`, `schedule_id`, `playlist_id`, `item_id` 등 진단 정보
+
 ## v2 예정
 
 - 디버그 overlay

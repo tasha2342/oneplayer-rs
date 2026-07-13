@@ -15,17 +15,37 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
+use serde::Serialize;
+use serde_json::Value;
 use tracing::info;
 
 use crate::settings::AppSettings;
 
 /// CMS HTTP API 클라이언트.
+#[derive(Clone)]
 pub struct CmsApiClient {
     client: Client,
     /// 끝 슬래시가 제거된 base URL.
     base_url: String,
     /// Bearer 인증 토큰 (없으면 헤더 생략).
     auth_token: Option<String>,
+}
+
+/// 재생 완료 로그 한 건.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaybackLogItem {
+    pub device_id: String,
+    pub content_type: String,
+    pub content_id: i64,
+    pub started_at: String,
+    pub ended_at: String,
+    pub completed: bool,
+    pub extra: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct PlaybackLogBatchRequest<'a> {
+    items: &'a [PlaybackLogItem],
 }
 
 impl CmsApiClient {
@@ -60,6 +80,16 @@ impl CmsApiClient {
         info!(%url, "fetching playback data");
         let response: PlaybackDataResponse = self.get_json(&url).await?;
         Ok(response.data)
+    }
+
+    /// 재생 완료 로그를 배치로 전송한다.
+    pub async fn post_playback_logs_batch(&self, items: &[PlaybackLogItem]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let url = format!("{}/v1/playback-logs/batch", self.api_root());
+        self.post_json(&url, &PlaybackLogBatchRequest { items })
+            .await
     }
 
     /// 마지막 성공 play_data를 오프라인 부팅용으로 JSON 파일에 저장한다.
@@ -105,5 +135,23 @@ impl CmsApiClient {
             anyhow::bail!("CMS request failed: {status} {body}");
         }
         serde_json::from_str(&body).with_context(|| format!("failed to parse CMS JSON from {url}"))
+    }
+
+    /// JSON POST 요청을 보내고 성공 status만 확인한다.
+    async fn post_json<T: Serialize + ?Sized>(&self, url: &str, body: &T) -> Result<()> {
+        let mut req = self.client.post(url).json(body);
+        if let Some(token) = &self.auth_token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        let response = req.send().await.context("CMS POST request failed")?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("failed to read CMS POST body")?;
+        if !status.is_success() {
+            anyhow::bail!("CMS POST request failed: {status} {text}");
+        }
+        Ok(())
     }
 }

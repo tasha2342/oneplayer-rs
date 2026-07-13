@@ -16,6 +16,7 @@ use winit::window::Window;
 pub(super) struct Vertex {
     position: [f32; 2],
     tex_coords: [f32; 2],
+    opacity: f32,
 }
 
 /// 캔버스 픽셀 좌표(top-left 원점)의 요소 rect를 NDC quad 정점으로 변환한다.
@@ -40,40 +41,48 @@ pub(super) fn quad_vertices(
         Vertex {
             position: [x0, y1],
             tex_coords: [0.0, 1.0],
+            opacity: 1.0,
         },
         Vertex {
             position: [x1, y1],
             tex_coords: [1.0, 1.0],
+            opacity: 1.0,
         },
         Vertex {
             position: [x1, y0],
             tex_coords: [1.0, 0.0],
+            opacity: 1.0,
         },
         Vertex {
             position: [x0, y1],
             tex_coords: [0.0, 1.0],
+            opacity: 1.0,
         },
         Vertex {
             position: [x1, y0],
             tex_coords: [1.0, 0.0],
+            opacity: 1.0,
         },
         Vertex {
             position: [x0, y0],
             tex_coords: [0.0, 0.0],
+            opacity: 1.0,
         },
     ]
 }
 
-/// 기존 quad를 NDC 좌표계 오프셋만큼 이동한 정점 배열을 만든다.
-pub(super) fn translated_vertices(
+/// 기존 quad에 NDC 오프셋과 opacity를 반영한 정점 배열을 만든다.
+pub(super) fn transformed_vertices(
     vertices: &[Vertex; 6],
     offset_x: f32,
     offset_y: f32,
+    opacity: f32,
 ) -> [Vertex; 6] {
     let mut translated = *vertices;
     for vertex in &mut translated {
         vertex.position[0] += offset_x;
         vertex.position[1] += offset_y;
+        vertex.opacity = opacity;
     }
     translated
 }
@@ -317,6 +326,11 @@ impl GpuContext {
                             offset: 8,
                             shader_location: 1,
                             format: wgpu::VertexFormat::Float32x2,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 16,
+                            shader_location: 2,
+                            format: wgpu::VertexFormat::Float32,
                         },
                     ],
                 }],
