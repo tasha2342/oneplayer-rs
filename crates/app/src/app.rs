@@ -102,7 +102,7 @@ impl App {
             async move { engine.start().await }
         });
 
-        // 엔진 이벤트를 로그로 흘린다 (v2 debug overlay의 데이터 소스).
+        // 엔진 이벤트를 로그로 흘린다 (debug overlay의 데이터 소스).
         runtime.spawn(log_engine_events(event_rx));
 
         Ok(Self {
@@ -141,10 +141,21 @@ impl App {
     fn apply_saved_settings(&mut self, updated: AppSettings) {
         let canvas_changed = updated.canvas_width != self.settings.canvas_width
             || updated.canvas_height != self.settings.canvas_height;
+        let fullscreen_changed = updated.fullscreen != self.settings.fullscreen;
 
         self.settings = updated;
         if let Some(ui) = self.settings_ui.as_mut() {
             ui.sync_from_settings(&self.settings);
+        }
+
+        if fullscreen_changed {
+            if let Some(window) = &self.window {
+                if self.settings.fullscreen {
+                    window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                } else {
+                    window.set_fullscreen(None);
+                }
+            }
         }
 
         if canvas_changed {
@@ -166,20 +177,26 @@ impl App {
     /// scene prepare(백그라운드) → hidden 레이어 preload → 목표 시각 전환 예약.
     /// prepare 실패 시 엔진에 실패를 회신한다 (현재 화면 유지 fallback).
     fn handle_switch_commands(&mut self) {
+        // 1. 이전 프레임에서 spawn_blocking으로 시작한 prepare 결과를 먼저 회수한다.
+        //    try_recv는 대기하지 않으므로, 결과가 없으면 즉시 다음 단계로 넘어간다.
         while let Ok(outcome) = self.prepared_rx.try_recv() {
             match outcome {
                 PrepareOutcome::Ready {
                     scene,
                     target_time_millis,
                 } => {
+                    // prepare가 끝났으므로 중복 prepare 방지 목록에서 제거한다.
                     self.preparing.remove(&scene.scene.scene_id);
                     if let Some(compositor) = self.compositor.as_mut() {
                         let scene_id = scene.scene.scene_id.clone();
                         let preload_started = Instant::now();
                         let preload_now = self.clock.now_millis();
+                        // 준비된 scene을 hidden 레이어에 GPU 리소스로 올린다.
+                        // 실제 표출 시점에는 이 무거운 업로드를 하지 않는다.
                         compositor.preload(scene);
                         let gpu_preload_ms = preload_started.elapsed().as_millis();
                         let scheduled_now = self.clock.now_millis();
+                        // 목표 시각이 되면 hidden 레이어가 active가 되도록 예약한다.
                         compositor.switch_at(target_time_millis);
                         timing_log::record(
                             "INFO",
@@ -206,6 +223,7 @@ impl App {
                     target_time_millis,
                     reason,
                 } => {
+                    // prepare 실패 시 해당 scene은 전환하지 않고 현재 화면을 유지한다.
                     self.preparing.remove(&scene_id);
                     timing_log::record(
                         "ERROR",
@@ -223,13 +241,17 @@ impl App {
             }
         }
 
+        // 2. 엔진(core)이 새로 보낸 전환 명령을 모두 꺼내 prepare 작업을 시작한다.
+        //    명령 수신 자체는 렌더 스레드에서 짧게 처리하고, 무거운 준비는 아래에서 분리한다.
         while let Ok(cmd) = self.switch_rx.try_recv() {
             let Some(preparer) = self.preparer.clone() else {
                 return;
             };
+            // 같은 scene prepare가 이미 진행 중이면 새 작업을 만들지 않는다.
             if !self.preparing.insert(cmd.scene.scene_id.clone()) {
                 continue;
             }
+            // blocking 스레드로 넘길 값들은 move closure가 소유할 수 있게 복사한다.
             let tx = self.prepared_tx.clone();
             let scene = cmd.scene.clone();
             let local_files = cmd.local_files.clone();
@@ -249,6 +271,8 @@ impl App {
                 ],
             );
             let clock = self.clock.clone();
+            // 이미지 decode, 영상 open/preroll은 오래 걸릴 수 있으므로 렌더 루프에서 직접 하지 않는다.
+            // 별도 blocking 스레드에서 처리해 기존 화면 렌더링이 계속 돌 수 있게 한다.
             self.runtime.spawn_blocking(move || {
                 let prepare_started = Instant::now();
                 let prepare_start_now = clock.now_millis();
@@ -262,6 +286,7 @@ impl App {
                     vec![],
                 );
                 let outcome = match preparer.lock() {
+                    // ScenePreparer는 이미지 캐시와 디코더 pool을 소유하므로 한 번에 하나씩 접근한다.
                     Ok(mut preparer) => match preparer.prepare(&scene, &local_files, now_millis) {
                         Ok(prepared) => {
                             timing_log::record(
@@ -277,6 +302,7 @@ impl App {
                                 )],
                             );
                             PrepareOutcome::Ready {
+                                // 성공 결과는 메인 렌더 루프가 다음 프레임에서 GPU preload한다.
                                 scene: prepared,
                                 target_time_millis,
                             }
@@ -304,12 +330,14 @@ impl App {
                             }
                         }
                     },
+                    // mutex가 poison되면 prepare 자체를 실패로 보고 엔진에 알린다.
                     Err(err) => PrepareOutcome::Failed {
                         scene_id,
                         target_time_millis,
                         reason: err.to_string(),
                     },
                 };
+                // blocking 작업 결과를 렌더 루프 쪽으로 돌려보낸다.
                 let _ = tx.send(outcome);
             });
         }
@@ -317,6 +345,7 @@ impl App {
 
     /// 매 프레임 수행: 전환 시각 검사(tick) → 결과 회신 → 화면 그리기.
     fn render_frame(&mut self) {
+        // 설정 UI가 저장을 요청하면, 렌더 중 borrow 충돌을 피하려고 일단 값만 빼둔다.
         let mut pending_save: Option<AppSettings> = None;
         if let (Some(ui), Some(window)) = (self.settings_ui.as_mut(), self.window.as_ref()) {
             if let SettingsAction::Save(updated) = ui.update(window, &self.settings) {
@@ -324,6 +353,7 @@ impl App {
             }
             self.update_cursor_visibility();
         }
+        // UI borrow가 끝난 뒤 실제 파일 저장과 런타임 반영을 수행한다.
         if let Some(updated) = pending_save {
             match updated.save(&self.config_path) {
                 Ok(()) => {
@@ -350,6 +380,8 @@ impl App {
             }
         }
 
+        // overlay 렌더링에는 SettingsUi와 Window가 필요하지만,
+        // 아래에서 compositor를 mutable로 빌리므로 필요한 핸들만 미리 분리한다.
         let overlay = self
             .settings_ui
             .as_mut()
@@ -361,6 +393,7 @@ impl App {
         };
         // 정밀 전환 검사: 목표 시각에 도달한 첫 프레임에서 전환된다.
         if let Some(result) = compositor.tick() {
+            // 전환 완료 시간을 엔진에 알려 재생 로그와 복구 판단 기준을 갱신한다.
             if let Some(engine) = &self.engine {
                 engine.on_scene_switched(
                     &result.scene_id,
@@ -371,6 +404,7 @@ impl App {
         }
 
         if let Some((ui_ptr, window)) = overlay {
+            // scene을 먼저 그리고, 같은 render pass 흐름 안에서 설정 UI를 덧그린다.
             let (device, queue, _) = compositor.gpu_resources();
             let device = device.clone();
             let queue = queue.clone();
@@ -380,6 +414,7 @@ impl App {
                 ui.render(&device, &queue, encoder, view, width, height, &window);
             });
         } else {
+            // overlay가 없으면 scene만 렌더링한다.
             let _ = compositor.render();
         }
     }

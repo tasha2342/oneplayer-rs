@@ -316,6 +316,7 @@ impl PlaybackEngine {
     /// - 같은 scene에 대한 직전 시도로부터 재시도 간격(5초)이 지났을 때
     ///
     /// 시도로 판정되면 `last_recovery`를 갱신해 과도한 재발송을 막는다.
+    
     fn needs_recovery_dispatch(
         &self,
         current: &PlaybackScene,

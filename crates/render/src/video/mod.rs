@@ -210,8 +210,9 @@ impl FfmpegCliDecoder {
         hwaccel: impl Into<String>,
         hw_disabled: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let ffmpeg_exe = find_ffmpeg_tool(ffmpeg_binary_name())
-            .context("ffmpeg executable not found (checked ONEPLAYER_FFMPEG_DIR, exe dir, tools/ffmpeg, PATH)")?;
+        let ffmpeg_exe = find_ffmpeg_tool(ffmpeg_binary_name()).context(
+            "ffmpeg executable not found (checked ONEPLAYER_FFMPEG_DIR, C:\\ffmpeg, Desktop\\ffmpeg, exe dir, tools/ffmpeg, PATH)",
+        )?;
         let ffprobe_exe = find_ffmpeg_tool(ffprobe_binary_name());
         let hwaccel = normalize_hwaccel(hwaccel.into());
         if hwaccel_enabled(&hwaccel) {
@@ -255,6 +256,7 @@ impl FfmpegCliDecoder {
         let hwaccel = self.effective_hwaccel().to_string();
 
         let mut cmd = Command::new(&self.ffmpeg_exe);
+        prepend_tool_dir_to_path(&mut cmd, &self.ffmpeg_exe);
         cmd.args(["-hide_banner", "-loglevel", "error"]);
         append_hwaccel_args(&mut cmd, &hwaccel);
         if self.loop_playback {
@@ -583,6 +585,7 @@ fn reader_loop(
 /// ffprobe로 영상의 평균 fps를 조회한다 (`avg_frame_rate`, 예: "30000/1001").
 fn probe_fps(ffprobe: &Path, video: &Path) -> Option<f64> {
     let mut cmd = Command::new(ffprobe);
+    prepend_tool_dir_to_path(&mut cmd, ffprobe);
     cmd.args([
         "-v",
         "error",
@@ -651,36 +654,86 @@ fn ffprobe_binary_name() -> &'static str {
 
 /// ffmpeg/ffprobe 실행 파일을 탐색한다.
 ///
-/// 우선순위: `ONEPLAYER_FFMPEG_DIR` 환경변수 → exe와 같은 폴더
-/// → 작업 디렉터리의 `tools/ffmpeg` → PATH.
+/// 우선순위: `ONEPLAYER_FFMPEG_DIR` → `C:\ffmpeg` → 바탕화면 `ffmpeg`
+/// → exe와 같은 폴더 → `tools/ffmpeg` → PATH.
 fn find_ffmpeg_tool(name: &str) -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("ONEPLAYER_FFMPEG_DIR") {
-        let candidate = PathBuf::from(dir).join(name);
-        if candidate.is_file() {
-            return Some(candidate);
+        if let Some(found) = tool_in_dir(Path::new(&dir), name) {
+            return Some(found);
+        }
+    }
+    for dir in ffmpeg_search_dirs() {
+        if let Some(found) = tool_in_dir(&dir, name) {
+            return Some(found);
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
+            if let Some(found) = tool_in_dir(dir, name) {
+                return Some(found);
             }
         }
     }
-    let candidate = PathBuf::from("tools").join("ffmpeg").join(name);
-    if candidate.is_file() {
-        return Some(candidate);
+    if let Some(found) = tool_in_dir(&Path::new("tools").join("ffmpeg"), name) {
+        return Some(found);
     }
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
+            if let Some(found) = tool_in_dir(&dir, name) {
+                return Some(found);
             }
         }
     }
     None
+}
+
+/// FFmpeg 번들을 찾을 고정 경로 (탐색 순서).
+fn ffmpeg_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from(r"C:\ffmpeg"), PathBuf::from(r"C:\ffmpeg\bin")];
+    for desktop in desktop_dirs() {
+        dirs.push(desktop.join("ffmpeg"));
+        dirs.push(desktop);
+    }
+    dirs
+}
+
+/// 사용자 바탕화면 경로 (로캘·OneDrive 변형 포함).
+fn desktop_dirs() -> Vec<PathBuf> {
+    let Some(profile) = std::env::var_os("USERPROFILE") else {
+        return Vec::new();
+    };
+    let profile = PathBuf::from(profile);
+    [
+        "Desktop",
+        "바탕 화면",
+        "OneDrive\\Desktop",
+        "OneDrive\\바탕 화면",
+    ]
+    .into_iter()
+    .map(|name| profile.join(name))
+    .filter(|path| path.is_dir())
+    .collect()
+}
+
+fn tool_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
+    let candidate = dir.join(name);
+    candidate.is_file().then_some(candidate)
+}
+
+/// ffmpeg.exe와 같은 폴더의 DLL을 Windows가 찾을 수 있도록 PATH 앞에 둔다.
+fn prepend_tool_dir_to_path(cmd: &mut Command, tool: &Path) {
+    let Some(dir) = tool.parent() else {
+        return;
+    };
+    let new_path = match std::env::var_os("PATH") {
+        Some(paths) => {
+            let mut parts = vec![dir.to_path_buf()];
+            parts.extend(std::env::split_paths(&paths));
+            std::env::join_paths(parts).unwrap_or(paths)
+        }
+        None => dir.as_os_str().to_os_string(),
+    };
+    cmd.env("PATH", new_path);
 }
 
 /// 사용 가능한 디코더 구현을 생성한다.
@@ -806,7 +859,11 @@ fn video_filter(hwaccel: &str, width: u32, height: u32) -> String {
 
 #[cfg(test)]
 mod hwaccel_tests {
-    use super::{append_hwaccel_args, hwaccel_enabled, normalize_hwaccel, video_filter};
+    use super::{
+        append_hwaccel_args, desktop_dirs, ffmpeg_search_dirs, hwaccel_enabled, normalize_hwaccel,
+        video_filter,
+    };
+    use std::path::PathBuf;
     use std::process::Command;
 
     #[test]
@@ -838,5 +895,15 @@ mod hwaccel_tests {
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
         assert!(args.windows(2).any(|w| w == ["-hwaccel", "cuda"]));
+    }
+
+    #[test]
+    fn ffmpeg_search_dirs_prefers_c_drive_and_desktop() {
+        let dirs = ffmpeg_search_dirs();
+        assert_eq!(dirs[0], PathBuf::from(r"C:\ffmpeg"));
+        assert_eq!(dirs[1], PathBuf::from(r"C:\ffmpeg\bin"));
+        for desktop in desktop_dirs() {
+            assert!(dirs.contains(&desktop.join("ffmpeg")));
+        }
     }
 }

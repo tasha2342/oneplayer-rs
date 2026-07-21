@@ -1,0 +1,12 @@
+device_id = "DV-1001"
+cms_base_url = "https://kn.jdone.co.kr/api"
+auth_token = ""
+ntp_server = "101.79.18.207"
+schedule_sync_interval_sec = 300
+asset_preload_minutes = 5
+max_cache_size_mb = 1024
+canvas_width = 1080
+canvas_height = 1920
+fullscreen = true
+ffmpeg_hwaccel = "d3d11va"
+settings_button_transparent = false

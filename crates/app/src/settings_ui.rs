@@ -35,6 +35,7 @@ pub struct SettingsUi {
     draft_ntp_server: String,
     draft_canvas_width: String,
     draft_canvas_height: String,
+    draft_fullscreen: bool,
     draft_settings_button_transparent: bool,
     status_message: Option<String>,
     settings_icon: Option<TextureHandle>,
@@ -72,6 +73,7 @@ impl SettingsUi {
             draft_ntp_server: String::new(),
             draft_canvas_width: String::new(),
             draft_canvas_height: String::new(),
+            draft_fullscreen: false,
             draft_settings_button_transparent: false,
             status_message: None,
             settings_icon,
@@ -88,6 +90,7 @@ impl SettingsUi {
         self.draft_ntp_server = settings.ntp_server.clone();
         self.draft_canvas_width = settings.canvas_width.to_string();
         self.draft_canvas_height = settings.canvas_height.to_string();
+        self.draft_fullscreen = settings.fullscreen;
         self.draft_settings_button_transparent = settings.settings_button_transparent;
     }
 
@@ -119,6 +122,7 @@ impl SettingsUi {
             let draft_ntp_server = &mut self.draft_ntp_server;
             let draft_canvas_width = &mut self.draft_canvas_width;
             let draft_canvas_height = &mut self.draft_canvas_height;
+            let draft_fullscreen = &mut self.draft_fullscreen;
             let draft_settings_button_transparent = &mut self.draft_settings_button_transparent;
             let status_message = &mut self.status_message;
             let settings_icon = self.settings_icon.as_ref();
@@ -133,6 +137,7 @@ impl SettingsUi {
                     draft_ntp_server,
                     draft_canvas_width,
                     draft_canvas_height,
+                    draft_fullscreen,
                     draft_settings_button_transparent,
                     status_message,
                     settings_icon,
@@ -214,6 +219,7 @@ fn draw_ui(
     draft_ntp_server: &mut String,
     draft_canvas_width: &mut String,
     draft_canvas_height: &mut String,
+    draft_fullscreen: &mut bool,
     draft_settings_button_transparent: &mut bool,
     status_message: &mut Option<String>,
     settings_icon: Option<&TextureHandle>,
@@ -228,6 +234,7 @@ fn draw_ui(
             draft_ntp_server,
             draft_canvas_width,
             draft_canvas_height,
+            draft_fullscreen,
             draft_settings_button_transparent,
             status_message,
             settings_icon,
@@ -276,6 +283,20 @@ fn draw_ui(
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             ui.label(
+                                RichText::new("전체 화면 표시")
+                                    .color(Color32::from_rgb(210, 218, 230)),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add(toggle_switch(draft_fullscreen));
+                                },
+                            );
+                        });
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
                                 RichText::new("설정 버튼 투명 처리")
                                     .color(Color32::from_rgb(210, 218, 230)),
                             );
@@ -315,6 +336,7 @@ fn draw_ui(
                                     draft_ntp_server,
                                     draft_canvas_width,
                                     draft_canvas_height,
+                                    draft_fullscreen,
                                     draft_settings_button_transparent,
                                 );
                             }
@@ -339,6 +361,7 @@ fn draw_ui(
                                             draft_ntp_server,
                                             draft_canvas_width,
                                             draft_canvas_height,
+                                            *draft_fullscreen,
                                             *draft_settings_button_transparent,
                                         ) {
                                             Ok(updated) => {
@@ -370,6 +393,7 @@ fn draw_settings_button(
     draft_ntp_server: &mut String,
     draft_canvas_width: &mut String,
     draft_canvas_height: &mut String,
+    draft_fullscreen: &mut bool,
     draft_settings_button_transparent: &mut bool,
     status_message: &mut Option<String>,
     settings_icon: Option<&TextureHandle>,
@@ -420,6 +444,7 @@ fn draw_settings_button(
                     draft_ntp_server,
                     draft_canvas_width,
                     draft_canvas_height,
+                    draft_fullscreen,
                     draft_settings_button_transparent,
                 );
             }
@@ -451,6 +476,7 @@ fn sync_draft_from_settings(
     draft_ntp_server: &mut String,
     draft_canvas_width: &mut String,
     draft_canvas_height: &mut String,
+    draft_fullscreen: &mut bool,
     draft_settings_button_transparent: &mut bool,
 ) {
     *draft_cms_base_url = settings.cms_base_url.clone();
@@ -458,6 +484,7 @@ fn sync_draft_from_settings(
     *draft_ntp_server = settings.ntp_server.clone();
     *draft_canvas_width = settings.canvas_width.to_string();
     *draft_canvas_height = settings.canvas_height.to_string();
+    *draft_fullscreen = settings.fullscreen;
     *draft_settings_button_transparent = settings.settings_button_transparent;
 }
 
@@ -468,6 +495,7 @@ fn build_settings(
     draft_ntp_server: &str,
     draft_canvas_width: &str,
     draft_canvas_height: &str,
+    fullscreen: bool,
     settings_button_transparent: bool,
 ) -> Result<AppSettings, String> {
     let canvas_width = draft_canvas_width
@@ -488,6 +516,7 @@ fn build_settings(
     updated.ntp_server = draft_ntp_server.trim().to_string();
     updated.canvas_width = canvas_width;
     updated.canvas_height = canvas_height;
+    updated.fullscreen = fullscreen;
     updated.settings_button_transparent = settings_button_transparent;
 
     updated
