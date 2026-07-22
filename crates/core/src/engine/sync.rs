@@ -7,6 +7,7 @@
 //! - NTP 실패 시 CMS `server_time`을 fallback으로 사용
 //! - 마지막 성공 play_data는 로컬에 캐시해 오프라인 부팅에 사용
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -28,6 +29,9 @@ impl PlaybackEngine {
     /// 실패해도 루프는 끊기지 않고 다음 주기에 재시도한다.
     pub(crate) async fn run_sync_loop(self: Arc<Self>) {
         loop {
+            if self.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
             if let Err(err) = self.sync_once().await {
                 error!("sync failed: {err:#}");
                 self.set_state(EngineState::Error).await;
@@ -118,10 +122,62 @@ impl PlaybackEngine {
     /// 타임라인을 활성화한다: preload window 에셋 blocking 준비
     /// → 나머지 백그라운드 다운로드 → 활성 타임라인 교체 → 재생 루프 재시작.
     async fn apply_timeline(self: &Arc<Self>, timeline: &PlaybackTimeline) -> Result<()> {
+        if let Ok(mut failed) = self.failed_rtb_slots.lock() {
+            failed.clear();
+        }
         // 표출 임박(preload window) 에셋은 blocking으로 준비한다.
         self.set_state(EngineState::Downloading).await;
         let blocking = self.preload_window_assets(timeline);
-        self.assets.ensure_assets(&blocking).await?;
+        let baseline_keys: std::collections::HashSet<_> = timeline
+            .scenes
+            .iter()
+            .flat_map(|scene| {
+                let own = (scene.rtb.is_none())
+                    .then_some(scene.asset_refs.iter())
+                    .into_iter()
+                    .flatten();
+                let fallback = scene
+                    .fallback_scene
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|fallback| fallback.asset_refs.iter());
+                own.chain(fallback)
+            })
+            .map(AssetRef::cache_key)
+            .collect();
+        let baseline: Vec<_> = blocking
+            .iter()
+            .filter(|asset| baseline_keys.contains(&asset.cache_key()))
+            .cloned()
+            .collect();
+        self.assets.ensure_assets(&baseline).await?;
+        for asset in blocking
+            .iter()
+            .filter(|asset| !baseline_keys.contains(&asset.cache_key()))
+        {
+            if let Err(err) = self.assets.ensure_assets(std::slice::from_ref(asset)).await {
+                let slot_ids: Vec<_> = timeline
+                    .scenes
+                    .iter()
+                    .filter(|scene| {
+                        scene.rtb.is_some()
+                            && scene
+                                .asset_refs
+                                .iter()
+                                .any(|candidate| candidate.cache_key() == asset.cache_key())
+                    })
+                    .filter_map(|scene| scene.rtb.as_ref().map(|rtb| rtb.slot_id.clone()))
+                    .collect();
+                if let Ok(mut failed) = self.failed_rtb_slots.lock() {
+                    failed.extend(slot_ids.iter().cloned());
+                }
+                warn!(
+                    slots = ?slot_ids,
+                    error = %err,
+                    "RTB preload failed; baseline fallback will be used"
+                );
+            }
+        }
 
         // 나머지 에셋은 재생을 막지 않도록 백그라운드에서 받는다.
         self.spawn_background_downloads(timeline, &blocking);
@@ -203,13 +259,25 @@ impl PlaybackEngine {
         let mut refs: Vec<_> = timeline
             .scenes_in_window(now, window_end)
             .into_iter()
-            .flat_map(|s| s.asset_refs.clone())
+            .flat_map(|scene| {
+                let mut refs = scene.asset_refs.clone();
+                if let Some(fallback) = &scene.fallback_scene {
+                    refs.extend(fallback.asset_refs.clone());
+                }
+                refs
+            })
             .collect();
         if let Some(current) = timeline.current_scene(now) {
             refs.extend(current.asset_refs.clone());
+            if let Some(fallback) = &current.fallback_scene {
+                refs.extend(fallback.asset_refs.clone());
+            }
         }
         if let Some(next) = timeline.next_scene(now) {
             refs.extend(next.asset_refs.clone());
+            if let Some(fallback) = &next.fallback_scene {
+                refs.extend(fallback.asset_refs.clone());
+            }
         }
 
         refs.sort_by(|a, b| a.cache_key().cmp(&b.cache_key()));

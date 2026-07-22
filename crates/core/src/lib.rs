@@ -20,6 +20,7 @@ pub mod engine;
 pub mod settings;
 pub mod timeline;
 pub mod timing_log;
+mod tracking;
 
 pub use cache::{AssetStore, CacheCleanupResult};
 pub use clock::{Clock, ClockConfidence, ClockSnapshot, ClockSyncResult, SignageClock, SntpClient};
@@ -28,5 +29,6 @@ pub use config::PolicyConfig;
 pub use engine::{EngineEvent, EngineState, PlaybackEngine};
 pub use settings::AppSettings;
 pub use timeline::{
-    AssetRef, LayoutDefinition, LayoutElement, PlaybackScene, PlaybackTimeline, TimelineBuilder,
+    AssetRef, LayoutDefinition, LayoutElement, PlaybackScene, PlaybackTimeline, RtbSceneMetadata,
+    TimelineBuilder, TrackingEvent, TrackingUrl,
 };

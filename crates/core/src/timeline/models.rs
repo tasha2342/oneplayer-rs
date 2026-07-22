@@ -7,6 +7,64 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+/// RTB/VAST 표출 이벤트. JSON의 소문자 이름을 canonical 값으로 사용한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrackingEvent {
+    Impression,
+    Start,
+    Firstquartile,
+    Midpoint,
+    Thirdquartile,
+    Complete,
+}
+
+impl TrackingEvent {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().replace(['_', '-'], "").as_str() {
+            "impression" => Some(Self::Impression),
+            "start" => Some(Self::Start),
+            "firstquartile" => Some(Self::Firstquartile),
+            "midpoint" => Some(Self::Midpoint),
+            "thirdquartile" => Some(Self::Thirdquartile),
+            "complete" => Some(Self::Complete),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Impression => "impression",
+            Self::Start => "start",
+            Self::Firstquartile => "firstquartile",
+            Self::Midpoint => "midpoint",
+            Self::Thirdquartile => "thirdquartile",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+/// 이벤트별 외부 tracking beacon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackingUrl {
+    pub event: TrackingEvent,
+    pub url: String,
+}
+
+/// RTB 장면에만 존재하는 bid/creative 메타데이터.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RtbSceneMetadata {
+    pub slot_id: String,
+    pub request_id: Option<String>,
+    pub bid_id: String,
+    pub imp_id: String,
+    pub ad_id: String,
+    pub creative_id: String,
+    pub price: Option<f64>,
+    pub currency: String,
+    pub tracking: Vec<TrackingUrl>,
+}
+
 /// 다운로드해야 할 콘텐츠 파일 하나에 대한 참조.
 ///
 /// 동일 `file_id`라도 `revision`이 다르면 다른 파일로 취급한다
@@ -94,6 +152,12 @@ pub struct PlaybackScene {
     pub layout: Option<Arc<LayoutDefinition>>,
     /// 이 장면 표출에 필요한 에셋 목록.
     pub asset_refs: Vec<AssetRef>,
+    /// RTB 장면의 bid 및 tracking 메타데이터. 일반 편성은 `None`.
+    #[serde(default)]
+    pub rtb: Option<RtbSceneMetadata>,
+    /// RTB 준비 실패 시 같은 절대 구간에 표출할 일반 편성 장면.
+    #[serde(default)]
+    pub fallback_scene: Option<Box<PlaybackScene>>,
 }
 
 impl PlaybackScene {
@@ -213,7 +277,13 @@ impl PlaybackTimeline {
         let mut refs: Vec<AssetRef> = self
             .scenes
             .iter()
-            .flat_map(|s| s.asset_refs.clone())
+            .flat_map(|scene| {
+                let mut refs = scene.asset_refs.clone();
+                if let Some(fallback) = &scene.fallback_scene {
+                    refs.extend(fallback.asset_refs.clone());
+                }
+                refs
+            })
             .collect();
         refs.sort_by(|a, b| a.cache_key().cmp(&b.cache_key()));
         refs.dedup_by(|a, b| a.cache_key() == b.cache_key());
@@ -238,6 +308,8 @@ mod tests {
             loop_playback: false,
             layout: None,
             asset_refs: vec![],
+            rtb: None,
+            fallback_scene: None,
         }
     }
 

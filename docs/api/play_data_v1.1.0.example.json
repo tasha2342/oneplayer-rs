@@ -1,0 +1,159 @@
+{
+  "api_version": "1.1.0",
+  "device_id": "DV-1001",
+  "date": "2026-07-21",
+  "revision": "20260721-r42",
+  "timezone": "Asia/Seoul",
+  "server_time": "2026-07-21T14:00:00.000+09:00",
+  "slots": [
+    {
+      "start_time": "14:00:00",
+      "end_time": "14:59:59",
+      "schedule_id": 101,
+      "playlist_id": 20,
+      "playlist_name": "일반 편성",
+      "items": [
+        {
+          "id": 1,
+          "playlist_id": 20,
+          "position": 0,
+          "item_type": "image",
+          "ref_id": 1,
+          "duration_seconds": 15,
+          "loop": false,
+          "layout": {
+            "id": 2001,
+            "name": "일반 이미지",
+            "group_name": "default",
+            "width": 768,
+            "height": 1024,
+            "default_duration": 15,
+            "layout": [
+              {
+                "id": "normal-image",
+                "x": 0,
+                "y": 0,
+                "width": 768,
+                "height": 1024,
+                "type": "image",
+                "lock": false,
+                "keep_aspect_ratio": true,
+                "file_id": 28,
+                "z_index": 0
+              }
+            ]
+          },
+          "file_downloads": [
+            {
+              "file_id": 28,
+              "download_url": "https://cms.example.com/files/28",
+              "revision": "normal-image-r1",
+              "mime_type": "image/jpeg",
+              "size_bytes": 1024,
+              "checksum": null
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "rtb_slots": [
+    {
+      "id": "rtb-video-20260721-001",
+      "start_time": "14:10:30",
+      "end_time": "14:11:30",
+      "request_id": "req-20260721141030-001",
+      "currency": "KRW",
+      "items": [
+        {
+          "position": 0,
+          "bid_id": "bid-0003",
+          "imp_id": "1",
+          "price": 12000.0,
+          "ad_id": "ad-video-0003",
+          "creative_id": "ad-video-0003_1920x1080",
+          "expires_in_seconds": 1200,
+          "asset": {
+            "type": "video",
+            "mime_type": "video/mp4",
+            "download_url": "https://cdn.example.com/ad-video-0003.mp4",
+            "width": 1920,
+            "height": 1080,
+            "duration_seconds": 15,
+            "size_bytes": 20485760,
+            "checksum": null
+          },
+          "tracking": [
+            {
+              "event": "impression",
+              "url": "https://tracker.example.com/video/impression"
+            },
+            {
+              "event": "start",
+              "url": "https://tracker.example.com/video/start"
+            },
+            {
+              "event": "firstquartile",
+              "url": "https://tracker.example.com/video/firstquartile"
+            },
+            {
+              "event": "midpoint",
+              "url": "https://tracker.example.com/video/midpoint"
+            },
+            {
+              "event": "thirdquartile",
+              "url": "https://tracker.example.com/video/thirdquartile"
+            },
+            {
+              "event": "complete",
+              "url": "https://tracker.example.com/video/complete"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rtb-image-20260721-002",
+      "start_time": "14:20:00",
+      "end_time": "14:20:30",
+      "request_id": "req-20260721142000-002",
+      "currency": "KRW",
+      "items": [
+        {
+          "position": 0,
+          "bid_id": "bid-0004",
+          "imp_id": "1",
+          "price": 9000.0,
+          "ad_id": "ad-image-0004",
+          "creative_id": "ad-image-0004_768x1024",
+          "expires_in_seconds": 1200,
+          "asset": {
+            "type": "image",
+            "mime_type": "image/jpeg",
+            "download_url": "https://cdn.example.com/ad-image-0004.jpg",
+            "width": 768,
+            "height": 1024,
+            "duration_seconds": 15,
+            "size_bytes": 409600,
+            "checksum": null
+          },
+          "tracking": [
+            {
+              "event": "impression",
+              "url": "https://tracker.example.com/image/impression"
+            },
+            {
+              "event": "start",
+              "url": "https://tracker.example.com/image/start"
+            },
+            {
+              "event": "complete",
+              "url": "https://tracker.example.com/image/complete"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "assets": []
+}

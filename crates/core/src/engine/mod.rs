@@ -17,12 +17,13 @@ mod sync;
 
 pub use state::{EngineEvent, EngineState, SwitchCommand};
 
-use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use anyhow::Result;
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Mutex};
 use tracing::warn;
 
@@ -30,9 +31,24 @@ use crate::cache::AssetStore;
 use crate::clock::SignageClock;
 use crate::cms::CmsApiClient;
 use crate::settings::AppSettings;
-use crate::timeline::PlaybackTimeline;
+use crate::timeline::{PlaybackScene, PlaybackTimeline, RtbSceneMetadata};
+use crate::tracking::TrackingReporter;
 
 use self::playback_log::{ActivePlaybackLog, PlaybackLogReporter, PlaybackLogScene};
+
+#[derive(Clone)]
+pub(crate) struct TrackingScene {
+    pub metadata: RtbSceneMetadata,
+    pub duration_millis: i64,
+}
+
+pub(crate) struct ActiveTrackingSession {
+    pub scene_id: String,
+    pub metadata: RtbSceneMetadata,
+    pub started_at_millis: i64,
+    pub duration_millis: i64,
+    pub abort: tokio::task::AbortHandle,
+}
 
 /// 사이니지 재생 엔진.
 ///
@@ -63,12 +79,24 @@ pub struct PlaybackEngine {
     pub(crate) active_playback_log: Arc<StdMutex<Option<ActivePlaybackLog>>>,
     /// 완료된 재생 로그를 배치 전송하는 큐.
     pub(crate) playback_log_reporter: PlaybackLogReporter,
+    /// RTB 이벤트 URL 전용 비동기 큐.
+    pub(crate) tracking_reporter: Arc<TrackingReporter>,
+    /// scene_id → RTB tracking 메타데이터.
+    pub(crate) tracking_scenes: Arc<StdMutex<HashMap<String, TrackingScene>>>,
+    /// RTB prepare 실패 시 사용할 일반 편성 scene.
+    pub(crate) fallback_scenes: Arc<StdMutex<HashMap<String, PlaybackScene>>>,
+    /// 현재 revision에서 fallback으로 전환된 RTB 슬롯.
+    pub(crate) failed_rtb_slots: Arc<StdMutex<HashSet<String>>>,
+    /// 현재 표출 중인 RTB tracking 타이머.
+    pub(crate) active_tracking: Arc<StdMutex<Option<ActiveTrackingSession>>>,
     /// 진단/UI용 이벤트 발신 채널.
     pub(crate) events: mpsc::UnboundedSender<EngineEvent>,
     /// 렌더 스레드로 보내는 전환 명령 채널.
     pub(crate) switch_tx: mpsc::UnboundedSender<SwitchCommand>,
     /// 재생 루프 세대 번호. 타임라인이 교체되면 증가시켜 구세대 루프를 종료시킨다.
     pub(crate) playback_generation: Arc<AtomicU64>,
+    pub(crate) shutting_down: Arc<AtomicBool>,
+    pub(crate) runtime_handle: Handle,
 }
 
 impl PlaybackEngine {
@@ -78,6 +106,7 @@ impl PlaybackEngine {
         clock: Arc<SignageClock>,
         events: mpsc::UnboundedSender<EngineEvent>,
         switch_tx: mpsc::UnboundedSender<SwitchCommand>,
+        runtime_handle: Handle,
     ) -> Result<Self> {
         let cms = CmsApiClient::new(&settings)?;
         let assets = Arc::new(AssetStore::new(&settings)?);
@@ -93,9 +122,16 @@ impl PlaybackEngine {
             playback_log_scenes: Arc::new(StdMutex::new(HashMap::new())),
             active_playback_log: Arc::new(StdMutex::new(None)),
             playback_log_reporter: PlaybackLogReporter::new(),
+            tracking_reporter: Arc::new(TrackingReporter::new()?),
+            tracking_scenes: Arc::new(StdMutex::new(HashMap::new())),
+            fallback_scenes: Arc::new(StdMutex::new(HashMap::new())),
+            failed_rtb_slots: Arc::new(StdMutex::new(HashSet::new())),
+            active_tracking: Arc::new(StdMutex::new(None)),
             events,
             switch_tx,
             playback_generation: Arc::new(AtomicU64::new(0)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            runtime_handle,
         })
     }
 
@@ -106,6 +142,7 @@ impl PlaybackEngine {
     /// 3. 5분 주기 캐시 정리 루프 시작
     pub async fn start(self: Arc<Self>) {
         self.playback_log_reporter.start(self.cms.clone());
+        self.tracking_reporter.start();
 
         // 캐시 재생 시도 후 동기화 루프 진입.
         let engine = self.clone();
@@ -145,5 +182,21 @@ impl PlaybackEngine {
     /// 현재 설정을 반환한다.
     pub fn settings(&self) -> &AppSettings {
         &self.settings
+    }
+
+    /// tracking 큐를 drain하고 재생 태스크가 새 작업을 만들지 않게 한다.
+    pub async fn shutdown(&self) {
+        use std::sync::atomic::Ordering;
+
+        if self.shutting_down.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.playback_generation.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut active) = self.active_tracking.lock() {
+            if let Some(active) = active.take() {
+                active.abort.abort();
+            }
+        }
+        self.tracking_reporter.shutdown().await;
     }
 }

@@ -18,6 +18,9 @@ pub struct PlaybackDataResponse {
 /// 재생 데이터 본체 (하루치 스케줄).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PlaybackDataDto {
+    /// API 계약 버전. 누락되면 기존 v1.0 응답으로 취급한다.
+    #[serde(default)]
+    pub api_version: Option<String>,
     #[serde(rename = "device_id")]
     pub device_id: String,
     /// 스케줄 기준 날짜 (`YYYY-MM-DD`).
@@ -37,9 +40,86 @@ pub struct PlaybackDataDto {
     /// 최상위 에셋 메타데이터 목록.
     #[serde(default)]
     pub assets: Vec<PlaybackAssetDto>,
+    /// 일반 편성 위에 우선 표출하는 RTB 광고 구간(v1.1.0).
+    #[serde(default, deserialize_with = "deserialize_valid_rtb_slots")]
+    pub rtb_slots: Vec<RtbSlotDto>,
     /// 긴급 편성 등 override 데이터 (v1에서는 파싱만).
     #[serde(default, rename = "override")]
     pub override_data: Option<Value>,
+}
+
+/// 기존 일반 편성과 별도로 전달되는 RTB 광고 구간.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RtbSlotDto {
+    pub id: String,
+    #[serde(rename = "start_time")]
+    pub start_time: String,
+    #[serde(rename = "end_time")]
+    pub end_time: String,
+    #[serde(default, rename = "request_id")]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub currency: Option<String>,
+    pub items: Vec<RtbItemDto>,
+}
+
+/// RTB 슬롯 안에서 순서대로 재생되는 하나의 bid 결과.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RtbItemDto {
+    pub position: i32,
+    #[serde(rename = "bid_id")]
+    pub bid_id: String,
+    #[serde(rename = "imp_id")]
+    pub imp_id: String,
+    #[serde(default)]
+    pub price: Option<f64>,
+    #[serde(rename = "ad_id")]
+    pub ad_id: String,
+    #[serde(rename = "creative_id")]
+    pub creative_id: String,
+    #[serde(default, rename = "expires_in_seconds")]
+    pub expires_in_seconds: Option<i64>,
+    pub asset: RtbAssetDto,
+    #[serde(default)]
+    pub tracking: Vec<TrackingUrlDto>,
+}
+
+/// 플레이어가 직접 다운로드하고 표출하는 RTB 에셋.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RtbAssetDto {
+    #[serde(rename = "type")]
+    pub asset_type: String,
+    #[serde(rename = "mime_type")]
+    pub mime_type: String,
+    #[serde(rename = "download_url")]
+    pub download_url: String,
+    pub width: i32,
+    pub height: i32,
+    #[serde(rename = "duration_seconds")]
+    pub duration_seconds: i64,
+    #[serde(default, rename = "size_bytes")]
+    pub size_bytes: Option<i64>,
+    #[serde(default)]
+    pub checksum: Option<String>,
+}
+
+/// SSP/VAST 이벤트 하나와 호출할 beacon URL.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TrackingUrlDto {
+    pub event: String,
+    pub url: String,
+}
+
+/// 잘못된 RTB 슬롯 하나가 기존 일반 스케줄 전체를 무효화하지 않게 한다.
+fn deserialize_valid_rtb_slots<'de, D>(deserializer: D) -> Result<Vec<RtbSlotDto>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
 }
 
 /// 에셋(파일) 메타데이터.

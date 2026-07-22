@@ -11,7 +11,10 @@ mod builder;
 mod models;
 
 pub use builder::TimelineBuilder;
-pub use models::{AssetRef, LayoutDefinition, LayoutElement, PlaybackScene, PlaybackTimeline};
+pub use models::{
+    AssetRef, LayoutDefinition, LayoutElement, PlaybackScene, PlaybackTimeline, RtbSceneMetadata,
+    TrackingEvent, TrackingUrl,
+};
 
 #[cfg(test)]
 mod tests {
@@ -21,6 +24,7 @@ mod tests {
     /// 단일 item slot을 가진 최소 play_data 샘플을 만든다.
     fn sample_data() -> PlaybackDataDto {
         PlaybackDataDto {
+            api_version: None,
             device_id: "DV-1001".into(),
             date: "2026-05-20".into(),
             revision: "rev1".into(),
@@ -50,6 +54,7 @@ mod tests {
                 }],
             }],
             assets: vec![],
+            rtb_slots: vec![],
             override_data: None,
         }
     }

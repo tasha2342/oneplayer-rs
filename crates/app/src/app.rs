@@ -96,6 +96,7 @@ impl App {
             clock.clone(),
             event_tx,
             switch_tx,
+            runtime.handle().clone(),
         )?);
         runtime.spawn({
             let engine = engine.clone();
@@ -497,7 +498,12 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if let Some(engine) = &self.engine {
+                    self.runtime.block_on(engine.shutdown());
+                }
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(c) = self.compositor.as_mut() {
                     c.resize(size.width, size.height);

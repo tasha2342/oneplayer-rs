@@ -126,5 +126,7 @@ fn sample_scene(id: &str, start: i64, end: i64, color: &str) -> PlaybackScene {
             }],
         })),
         asset_refs: vec![],
+        rtb: None,
+        fallback_scene: None,
     }
 }

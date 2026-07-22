@@ -29,7 +29,7 @@ use crate::config::{
     FILE_CACHE_WARM_WINDOW_MS, MIN_PLAYBACK_LOOP_DELAY_MS, NO_SCENE_RETRY_MS, PRECISE_WINDOW_MS,
     SCENE_PREPARE_WINDOW_MS, VIDEO_FIRST_FRAME_WAIT_MS,
 };
-use crate::timeline::{PlaybackScene, PlaybackTimeline};
+use crate::timeline::{PlaybackScene, PlaybackTimeline, TrackingEvent};
 use crate::timing_log::{self, TimingValue};
 
 use super::state::{EngineEvent, EngineState, SwitchCommand};
@@ -80,9 +80,14 @@ impl PlaybackEngine {
             //    즉시 전환한다 (부팅 직후 / 전환 실패 / 타임라인 교체 직후).
             //    성공하면 on_scene_switched가 last_switched_scene을 갱신해
             //    다음 반복부터 이 경로를 타지 않는다.
-            if let Some(current) = timeline.current_scene(now) {
-                if self.needs_recovery_dispatch(current, now, &mut last_recovery) {
-                    if self.scene_assets_ready(current) {
+            if let Some(candidate) = timeline.current_scene(now) {
+                let mut current = self.resolved_scene(candidate);
+                if self.needs_recovery_dispatch(&current, now, &mut last_recovery) {
+                    if !self.scene_assets_ready(&current) && current.rtb.is_some() {
+                        self.mark_rtb_failed(&current);
+                        current = self.resolved_scene(candidate);
+                    }
+                    if self.scene_assets_ready(&current) {
                         info!(
                             step = 2,
                             generation,
@@ -92,7 +97,7 @@ impl PlaybackEngine {
                         let cmd = SwitchCommand {
                             scene: current.clone(),
                             target_time_millis: now,
-                            local_files: self.scene_local_files(current),
+                            local_files: self.scene_local_files(&current),
                         };
                         if self.switch_tx.send(cmd).is_err() {
                             warn!(
@@ -116,7 +121,7 @@ impl PlaybackEngine {
             }
 
             // step 2. 다음 표출 scene 선정.
-            let Some(next) = timeline.next_scene(now) else {
+            let Some(candidate) = timeline.next_scene(now) else {
                 debug!(
                     step = 2,
                     generation,
@@ -130,6 +135,7 @@ impl PlaybackEngine {
                 sleep_ms(NO_SCENE_RETRY_MS).await;
                 continue;
             };
+            let mut next = self.resolved_scene(candidate);
 
             debug!(
                 step = 2,
@@ -143,7 +149,7 @@ impl PlaybackEngine {
             // 이미 전환 명령을 보낸 scene이면, 그 다음 scene의 prepare window까지 대기한다.
             // (복구 경로가 주기적으로 동작하도록 대기는 재시도 간격으로 상한 처리)
             if dispatched.contains_key(&next.scene_id) {
-                let wake_at = next_wake_at(&timeline, next, now);
+                let wake_at = next_wake_at(&timeline, candidate, now);
                 let delay_ms = (wake_at - now)
                     .max(MIN_PLAYBACK_LOOP_DELAY_MS)
                     .min(NO_SCENE_RETRY_MS);
@@ -179,7 +185,11 @@ impl PlaybackEngine {
             }
 
             // step 4. 에셋이 로컬에 없으면 전환하지 않는다 (표출 시점 다운로드 금지).
-            if !self.scene_assets_ready(next) {
+            if !self.scene_assets_ready(&next) && next.rtb.is_some() {
+                self.mark_rtb_failed(&next);
+                next = self.resolved_scene(candidate);
+            }
+            if !self.scene_assets_ready(&next) {
                 timing_log::record(
                     "WARN",
                     2,
@@ -225,7 +235,7 @@ impl PlaybackEngine {
             self.set_state(EngineState::Preparing).await;
             // 이 scene의 asset_refs에서 정확한 캐시 경로를 계산한다
             // (전역 누적 맵 접두사 매칭 금지 — 검사한 파일 = 사용하는 파일).
-            let local_files = self.scene_local_files(next);
+            let local_files = self.scene_local_files(&next);
             let _ = self.events.send(EngineEvent::ScenePrepared {
                 scene_id: next.scene_id.clone(),
                 target_time_millis: next.start_time_millis,
@@ -270,7 +280,7 @@ impl PlaybackEngine {
             // step 6. 현재 scene 표출이 끝날 때까지 기다리지 않고,
             //    바로 다음 scene의 prepare window까지 대기한다.
             //    (복구 경로가 주기적으로 동작하도록 대기는 재시도 간격으로 상한 처리)
-            let wake_at = next_wake_at(&timeline, next, self.clock.now_millis());
+            let wake_at = next_wake_at(&timeline, candidate, self.clock.now_millis());
             let now = self.clock.now_millis();
             if wake_at > now {
                 let delay_ms = (wake_at - now)
@@ -307,6 +317,35 @@ impl PlaybackEngine {
             .collect()
     }
 
+    fn resolved_scene(&self, scene: &PlaybackScene) -> PlaybackScene {
+        let failed = scene.rtb.as_ref().is_some_and(|rtb| {
+            self.failed_rtb_slots
+                .lock()
+                .map(|failed| failed.contains(&rtb.slot_id))
+                .unwrap_or(false)
+        });
+        if failed {
+            if let Some(fallback) = &scene.fallback_scene {
+                return fallback.as_ref().clone();
+            }
+        }
+        scene.clone()
+    }
+
+    fn mark_rtb_failed(&self, scene: &PlaybackScene) {
+        let Some(rtb) = &scene.rtb else {
+            return;
+        };
+        if let Ok(mut failed) = self.failed_rtb_slots.lock() {
+            failed.insert(rtb.slot_id.clone());
+        }
+        warn!(
+            scene_id = %scene.scene_id,
+            slot_id = %rtb.slot_id,
+            "RTB slot disabled; using baseline fallback"
+        );
+    }
+
     /// 복구 경로 전환이 필요한지 판단한다.
     ///
     /// 조건:
@@ -316,7 +355,7 @@ impl PlaybackEngine {
     /// - 같은 scene에 대한 직전 시도로부터 재시도 간격(5초)이 지났을 때
     ///
     /// 시도로 판정되면 `last_recovery`를 갱신해 과도한 재발송을 막는다.
-    
+
     fn needs_recovery_dispatch(
         &self,
         current: &PlaybackScene,
@@ -359,8 +398,10 @@ impl PlaybackEngine {
         target_time_millis: i64,
         actual_time_millis: i64,
     ) {
+        self.finish_active_tracking(actual_time_millis);
         self.finish_active_playback_log(actual_time_millis, true);
         self.start_playback_log(scene_id, actual_time_millis);
+        self.start_tracking(scene_id, actual_time_millis);
 
         // 재생 루프의 복구 판단(step 2)에 쓰이는 "화면에 표출된 scene" 기록.
         if let Ok(mut last) = self.last_switched_scene.lock() {
@@ -391,11 +432,38 @@ impl PlaybackEngine {
             scene_id: scene_id.to_string(),
             reason: reason.to_string(),
         });
+
+        let fallback = self
+            .fallback_scenes
+            .lock()
+            .ok()
+            .and_then(|scenes| scenes.get(scene_id).cloned());
+        let metadata = self
+            .tracking_scenes
+            .lock()
+            .ok()
+            .and_then(|scenes| scenes.get(scene_id).cloned());
+        if let Some(metadata) = metadata {
+            if let Ok(mut failed) = self.failed_rtb_slots.lock() {
+                failed.insert(metadata.metadata.slot_id);
+            }
+        }
+        if let Some(fallback) = fallback {
+            let now = self.clock.now_millis();
+            if self.scene_assets_ready(&fallback) {
+                let command = SwitchCommand {
+                    local_files: self.scene_local_files(&fallback),
+                    scene: fallback,
+                    target_time_millis: now,
+                };
+                let _ = self.switch_tx.send(command);
+            }
+        }
     }
 
     /// 새 타임라인의 scene 로그 인덱스를 반영한다.
     pub(crate) fn refresh_playback_log_scenes(&self, timeline: &PlaybackTimeline) {
-        let scenes: HashMap<_, _> = timeline
+        let mut scenes: HashMap<_, _> = timeline
             .scenes
             .iter()
             .filter_map(|scene| {
@@ -403,6 +471,15 @@ impl PlaybackEngine {
                 Some((log_scene.scene_id.clone(), log_scene))
             })
             .collect();
+        for fallback in timeline
+            .scenes
+            .iter()
+            .filter_map(|scene| scene.fallback_scene.as_deref())
+        {
+            if let Some(log_scene) = super::playback_log::PlaybackLogScene::from_scene(fallback) {
+                scenes.insert(log_scene.scene_id.clone(), log_scene);
+            }
+        }
 
         let active_missing = self
             .active_playback_log
@@ -422,6 +499,102 @@ impl PlaybackEngine {
             *guard = scenes;
         } else {
             warn!("playback log scene index lock poisoned");
+        }
+
+        let tracking_scenes = timeline
+            .scenes
+            .iter()
+            .filter_map(|scene| {
+                scene.rtb.clone().map(|metadata| {
+                    (
+                        scene.scene_id.clone(),
+                        super::TrackingScene {
+                            metadata,
+                            duration_millis: scene.duration_ms(),
+                        },
+                    )
+                })
+            })
+            .collect();
+        let fallback_scenes = timeline
+            .scenes
+            .iter()
+            .filter_map(|scene| {
+                scene
+                    .fallback_scene
+                    .as_ref()
+                    .map(|fallback| (scene.scene_id.clone(), fallback.as_ref().clone()))
+            })
+            .collect();
+        if let Ok(mut guard) = self.tracking_scenes.lock() {
+            *guard = tracking_scenes;
+        }
+        if let Ok(mut guard) = self.fallback_scenes.lock() {
+            *guard = fallback_scenes;
+        }
+    }
+
+    fn start_tracking(&self, scene_id: &str, started_at_millis: i64) {
+        let tracking_scene = self
+            .tracking_scenes
+            .lock()
+            .ok()
+            .and_then(|scenes| scenes.get(scene_id).cloned());
+        let Some(tracking_scene) = tracking_scene else {
+            return;
+        };
+
+        self.tracking_reporter.record(
+            &tracking_scene.metadata,
+            scene_id,
+            TrackingEvent::Impression,
+        );
+        self.tracking_reporter
+            .record(&tracking_scene.metadata, scene_id, TrackingEvent::Start);
+
+        let reporter = self.tracking_reporter.clone();
+        let metadata = tracking_scene.metadata.clone();
+        let timer_scene_id = scene_id.to_string();
+        let duration_millis = tracking_scene.duration_millis.max(1);
+        let task = self.runtime_handle.spawn(async move {
+            let mut previous = 0i64;
+            for (target, event) in tracking_thresholds(duration_millis) {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    (target - previous).max(0) as u64
+                ))
+                .await;
+                reporter.record(&metadata, &timer_scene_id, event);
+                previous = target;
+            }
+        });
+        let session = super::ActiveTrackingSession {
+            scene_id: scene_id.to_string(),
+            metadata: tracking_scene.metadata,
+            started_at_millis,
+            duration_millis,
+            abort: task.abort_handle(),
+        };
+        if let Ok(mut active) = self.active_tracking.lock() {
+            *active = Some(session);
+        }
+    }
+
+    fn finish_active_tracking(&self, ended_at_millis: i64) {
+        let active = self
+            .active_tracking
+            .lock()
+            .ok()
+            .and_then(|mut active| active.take());
+        let Some(active) = active else {
+            return;
+        };
+        active.abort.abort();
+        if ended_at_millis >= active.started_at_millis + active.duration_millis {
+            self.tracking_reporter.record(
+                &active.metadata,
+                &active.scene_id,
+                TrackingEvent::Complete,
+            );
         }
     }
 
@@ -487,6 +660,11 @@ impl PlaybackEngine {
                 for a in &scene.asset_refs {
                     protected.insert(a.cache_key());
                 }
+                if let Some(fallback) = &scene.fallback_scene {
+                    for asset in &fallback.asset_refs {
+                        protected.insert(asset.cache_key());
+                    }
+                }
             };
             if let Some(current) = timeline.current_scene(now) {
                 protect_scene(current);
@@ -519,4 +697,31 @@ fn next_wake_at(timeline: &PlaybackTimeline, scene: &PlaybackScene, now: i64) ->
     }
     let end_at = scene.end_time_millis - MIN_PLAYBACK_LOOP_DELAY_MS;
     end_at.max(now + MIN_PLAYBACK_LOOP_DELAY_MS)
+}
+
+fn tracking_thresholds(duration_millis: i64) -> [(i64, TrackingEvent); 4] {
+    [
+        (duration_millis * 25 / 100, TrackingEvent::Firstquartile),
+        (duration_millis * 50 / 100, TrackingEvent::Midpoint),
+        (duration_millis * 75 / 100, TrackingEvent::Thirdquartile),
+        (duration_millis, TrackingEvent::Complete),
+    ]
+}
+
+#[cfg(test)]
+mod tracking_tests {
+    use super::*;
+
+    #[test]
+    fn quartile_thresholds_follow_scene_duration() {
+        assert_eq!(
+            tracking_thresholds(20_000),
+            [
+                (5_000, TrackingEvent::Firstquartile),
+                (10_000, TrackingEvent::Midpoint),
+                (15_000, TrackingEvent::Thirdquartile),
+                (20_000, TrackingEvent::Complete),
+            ]
+        );
+    }
 }

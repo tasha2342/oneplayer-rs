@@ -11,16 +11,22 @@ use std::sync::Arc;
 
 use chrono::{Local, NaiveDate, NaiveTime};
 use chrono_tz::Tz;
+use sha2::{Digest, Sha256};
+use tracing::warn;
 
 use crate::cms::{
-    FileDownloadDto, LayoutDto, PlaybackAssetDto, PlaybackDataDto, PlaybackItemDto, PlaybackSlotDto,
+    FileDownloadDto, LayoutDto, PlaybackAssetDto, PlaybackDataDto, PlaybackItemDto,
+    PlaybackSlotDto, RtbItemDto, RtbSlotDto,
 };
 use crate::config::{
     DAY_MS, DEFAULT_ITEM_DURATION_SECONDS, DEFAULT_ZONE_ID, MAX_EXPANDED_SCENES, ONE_SECOND_MS,
     TIMELINE_FUTURE_WINDOW_MS, TIMELINE_PAST_WINDOW_MS,
 };
 
-use super::models::{AssetRef, LayoutDefinition, LayoutElement, PlaybackScene, PlaybackTimeline};
+use super::models::{
+    AssetRef, LayoutDefinition, LayoutElement, PlaybackScene, PlaybackTimeline, RtbSceneMetadata,
+    TrackingEvent, TrackingUrl,
+};
 
 /// file_id → 최상위 asset 메타데이터 조회 테이블.
 type AssetLookup<'a> = HashMap<i64, &'a PlaybackAssetDto>;
@@ -59,9 +65,9 @@ impl TimelineBuilder {
             }
         }
 
-        let mut scenes = Vec::new();
+        let mut baseline_scenes = Vec::new();
         for slot in &data.slots {
-            scenes.extend(Self::build_slot_scenes(
+            baseline_scenes.extend(Self::build_slot_scenes(
                 data,
                 &asset_lookup,
                 &layout_cache,
@@ -71,6 +77,11 @@ impl TimelineBuilder {
                 now_millis,
             ));
         }
+        baseline_scenes.sort_by_key(|scene| scene.start_time_millis);
+
+        let rtb_scenes =
+            Self::build_rtb_scenes(data, &baseline_scenes, local_date, zone_id, now_millis);
+        let mut scenes = overlay_rtb_scenes(&baseline_scenes, rtb_scenes);
 
         // 시작 시각 → 종료 시각 → schedule_id 순으로 정렬.
         // 이후 PlaybackTimeline의 이진 탐색이 이 정렬을 전제로 한다.
@@ -93,6 +104,44 @@ impl TimelineBuilder {
                 .unwrap_or_else(|| DEFAULT_ZONE_ID.to_string()),
             scenes,
         }
+    }
+
+    /// RTB 슬롯을 full-screen image/video 장면으로 확장한다.
+    fn build_rtb_scenes(
+        data: &PlaybackDataDto,
+        baseline: &[PlaybackScene],
+        local_date: NaiveDate,
+        zone_id: Tz,
+        now_millis: i64,
+    ) -> Vec<PlaybackScene> {
+        let mut slots: Vec<_> = data
+            .rtb_slots
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| {
+                let range =
+                    time_range(&slot.start_time, &slot.end_time, local_date, zone_id, false);
+                (index, slot, range)
+            })
+            .collect();
+        slots.sort_by_key(|(index, _, (start, _))| (*start, *index));
+
+        let mut result = Vec::new();
+        let mut accepted_end = i64::MIN;
+        for (_, slot, (slot_start, slot_end)) in slots {
+            if slot_start < accepted_end {
+                warn!(slot_id = %slot.id, "ignoring overlapping RTB slot");
+                continue;
+            }
+            match build_rtb_slot_scenes(data, slot, baseline, slot_start, slot_end, now_millis) {
+                Some(mut scenes) if !scenes.is_empty() => {
+                    accepted_end = slot_end;
+                    result.append(&mut scenes);
+                }
+                _ => warn!(slot_id = %slot.id, "ignoring invalid RTB slot"),
+            }
+        }
+        result
     }
 
     /// play_data의 timezone 문자열을 파싱한다. 실패하면 Asia/Seoul을 사용한다.
@@ -124,7 +173,8 @@ impl TimelineBuilder {
         zone_id: Tz,
         now_millis: i64,
     ) -> Vec<PlaybackScene> {
-        let (slot_start_millis, slot_end_millis) = Self::slot_time_range(slot, local_date, zone_id);
+        let (slot_start_millis, slot_end_millis) =
+            time_range(&slot.start_time, &slot.end_time, local_date, zone_id, true);
 
         // position 순으로 item을 정렬해 재생 순서를 고정한다.
         let mut items = slot.items.clone();
@@ -176,31 +226,39 @@ impl TimelineBuilder {
             cycle_millis,
         })
     }
+}
 
-    /// slot의 시작/종료 시각(HH:MM:SS)을 epoch millis 구간으로 변환한다.
-    ///
-    /// 종료 시각에는 +1초를 더해 "23:59:59까지"가 실제로 자정까지 포함되게 한다.
-    /// 종료가 시작보다 빠르면 자정을 넘는 slot으로 보고 +1일 처리한다.
-    fn slot_time_range(slot: &PlaybackSlotDto, local_date: NaiveDate, zone_id: Tz) -> (i64, i64) {
-        let to_millis = |time_str: &str, extra_ms: i64| -> Option<i64> {
-            let time = NaiveTime::parse_from_str(time_str, "%H:%M:%S").ok()?;
-            local_date
-                .and_time(time)
-                .and_local_timezone(zone_id)
-                .single()
-                .map(|dt| dt.timestamp_millis() + extra_ms)
-        };
+/// slot의 시작/종료 시각(HH:MM:SS)을 epoch millis 구간으로 변환한다.
+/// 기존 일반 슬롯만 마지막 초를 포함하고 RTB는 `[start, end)`를 사용한다.
+fn time_range(
+    start_time: &str,
+    end_time: &str,
+    local_date: NaiveDate,
+    zone_id: Tz,
+    inclusive_last_second: bool,
+) -> (i64, i64) {
+    let to_millis = |time_str: &str, extra_ms: i64| -> Option<i64> {
+        let time = NaiveTime::parse_from_str(time_str, "%H:%M:%S").ok()?;
+        local_date
+            .and_time(time)
+            .and_local_timezone(zone_id)
+            .single()
+            .map(|dt| dt.timestamp_millis() + extra_ms)
+    };
 
-        let start_millis = to_millis(&slot.start_time, 0).unwrap_or(0);
-        let end_millis = to_millis(&slot.end_time, ONE_SECOND_MS).unwrap_or(start_millis);
-        // 자정을 넘어가는 slot (예: 22:00 ~ 02:00) 처리.
-        let slot_end_millis = if end_millis <= start_millis {
-            end_millis + DAY_MS
-        } else {
-            end_millis
-        };
-        (start_millis, slot_end_millis)
-    }
+    let start_millis = to_millis(start_time, 0).unwrap_or(0);
+    let end_extra = if inclusive_last_second {
+        ONE_SECOND_MS
+    } else {
+        0
+    };
+    let end_millis = to_millis(end_time, end_extra).unwrap_or(start_millis);
+    let slot_end_millis = if end_millis <= start_millis {
+        end_millis + DAY_MS
+    } else {
+        end_millis
+    };
+    (start_millis, slot_end_millis)
 }
 
 /// [`expand_slot_scenes`]의 인자 묶음.
@@ -264,6 +322,245 @@ fn expand_slot_scenes(p: ExpandParams) -> Vec<PlaybackScene> {
     scenes
 }
 
+fn build_rtb_slot_scenes(
+    data: &PlaybackDataDto,
+    slot: &RtbSlotDto,
+    baseline: &[PlaybackScene],
+    slot_start: i64,
+    slot_end: i64,
+    now_millis: i64,
+) -> Option<Vec<PlaybackScene>> {
+    if slot.id.trim().is_empty() || slot.items.is_empty() || slot_start >= slot_end {
+        return None;
+    }
+
+    let mut items = slot.items.clone();
+    items.sort_by_key(|item| item.position);
+    if items.iter().any(|item| !valid_rtb_item(item)) {
+        return None;
+    }
+
+    let durations: Vec<i64> = items
+        .iter()
+        .map(|item| item.asset.duration_seconds * ONE_SECOND_MS)
+        .collect();
+    let cycle_ms: i64 = durations.iter().sum();
+    if cycle_ms <= 0 {
+        return None;
+    }
+
+    let window_start = (now_millis - TIMELINE_PAST_WINDOW_MS).max(slot_start);
+    let window_end = (now_millis + TIMELINE_FUTURE_WINDOW_MS).min(slot_end);
+    if window_start >= window_end {
+        return Some(Vec::new());
+    }
+
+    let cycle_offset = (window_start - slot_start).max(0) % cycle_ms;
+    let mut item_index = 0usize;
+    let mut offset_before_item = 0i64;
+    while item_index < durations.len().saturating_sub(1)
+        && cycle_offset >= offset_before_item + durations[item_index]
+    {
+        offset_before_item += durations[item_index];
+        item_index += 1;
+    }
+
+    let mut cursor = window_start - (cycle_offset - offset_before_item);
+    let mut scenes = Vec::new();
+    while cursor < window_end && scenes.len() < MAX_EXPANDED_SCENES {
+        let item = &items[item_index];
+        let scene_end = (cursor + durations[item_index]).min(slot_end);
+        if scene_end > window_start {
+            scenes.push(build_rtb_scene(
+                data, slot, item, cursor, scene_end, baseline,
+            ));
+        }
+        cursor = scene_end;
+        item_index = (item_index + 1) % items.len();
+    }
+    Some(scenes)
+}
+
+fn valid_rtb_item(item: &RtbItemDto) -> bool {
+    let asset = &item.asset;
+    let supported = matches!(
+        (asset.asset_type.as_str(), asset.mime_type.as_str()),
+        ("video", "video/mp4") | ("image", "image/jpeg") | ("image", "image/png")
+    );
+    supported
+        && !item.bid_id.trim().is_empty()
+        && !item.creative_id.trim().is_empty()
+        && asset.download_url.starts_with("https://")
+        && asset.width > 0
+        && asset.height > 0
+        && asset.duration_seconds > 0
+        && asset.size_bytes.map_or(true, |size| size > 0)
+}
+
+fn build_rtb_scene(
+    data: &PlaybackDataDto,
+    slot: &RtbSlotDto,
+    item: &RtbItemDto,
+    start_millis: i64,
+    end_millis: i64,
+    baseline: &[PlaybackScene],
+) -> PlaybackScene {
+    let file_id = stable_id(&format!("rtb-file:{}", item.creative_id));
+    let layout_id = stable_id(&format!("rtb-layout:{}", item.creative_id));
+    let scene_id = format!(
+        "{}:rtb:{}:{}:{}",
+        data.revision, slot.id, item.bid_id, start_millis
+    );
+    let layout = Arc::new(LayoutDefinition {
+        id: layout_id,
+        name: format!("RTB {}", item.creative_id),
+        group_name: Some("rtb".to_string()),
+        width: item.asset.width,
+        height: item.asset.height,
+        elements: vec![LayoutElement {
+            id: format!("rtb-asset-{}", item.creative_id),
+            x: 0,
+            y: 0,
+            width: item.asset.width,
+            height: item.asset.height,
+            element_type: item.asset.asset_type.clone(),
+            keep_aspect_ratio: true,
+            file_id: Some(file_id),
+            content: None,
+            font: None,
+            font_size: None,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            background_color: Some("#000000".to_string()),
+            text_color: None,
+            border_color: None,
+            border_width: None,
+            z_index: Some(0),
+        }],
+        default_duration: Some(item.asset.duration_seconds),
+    });
+
+    let fallback_scene = baseline
+        .iter()
+        .find(|scene| {
+            scene.start_time_millis <= start_millis && scene.end_time_millis > start_millis
+        })
+        .or_else(|| {
+            baseline.iter().find(|scene| {
+                scene.end_time_millis > start_millis && scene.start_time_millis < end_millis
+            })
+        })
+        .map(|scene| {
+            let mut fallback = scene.clone();
+            fallback.scene_id = format!("fallback:{scene_id}:{}", scene.scene_id);
+            fallback.start_time_millis = start_millis;
+            fallback.end_time_millis = end_millis;
+            fallback.rtb = None;
+            fallback.fallback_scene = None;
+            Box::new(fallback)
+        });
+
+    let tracking = item
+        .tracking
+        .iter()
+        .filter_map(|entry| {
+            let event = TrackingEvent::parse(&entry.event)?;
+            if !(entry.url.starts_with("https://") || entry.url.starts_with("http://")) {
+                return None;
+            }
+            Some(TrackingUrl {
+                event,
+                url: entry.url.clone(),
+            })
+        })
+        .collect();
+
+    PlaybackScene {
+        scene_id,
+        schedule_id: stable_id(&format!("rtb-schedule:{}", slot.id)),
+        playlist_id: stable_id(&format!("rtb-playlist:{}", slot.id)),
+        item_id: stable_id(&format!("rtb-item:{}", item.bid_id)),
+        start_time_millis: start_millis,
+        end_time_millis: end_millis,
+        transition: None,
+        loop_playback: false,
+        layout: Some(layout),
+        asset_refs: vec![AssetRef {
+            file_id,
+            revision: item.creative_id.clone(),
+            download_url: item.asset.download_url.clone(),
+            mime_type: Some(item.asset.mime_type.clone()),
+            size_bytes: item.asset.size_bytes,
+            checksum: item.asset.checksum.clone(),
+        }],
+        rtb: Some(RtbSceneMetadata {
+            slot_id: slot.id.clone(),
+            request_id: slot.request_id.clone(),
+            bid_id: item.bid_id.clone(),
+            imp_id: item.imp_id.clone(),
+            ad_id: item.ad_id.clone(),
+            creative_id: item.creative_id.clone(),
+            price: item.price,
+            currency: slot.currency.clone().unwrap_or_else(|| "KRW".to_string()),
+            tracking,
+        }),
+        fallback_scene,
+    }
+}
+
+/// 일반 scene에서 RTB 구간을 잘라낸 뒤 RTB scene을 삽입한다.
+fn overlay_rtb_scenes(
+    baseline: &[PlaybackScene],
+    mut rtb_scenes: Vec<PlaybackScene>,
+) -> Vec<PlaybackScene> {
+    if rtb_scenes.is_empty() {
+        return baseline.to_vec();
+    }
+    rtb_scenes.sort_by_key(|scene| scene.start_time_millis);
+    let mut result = Vec::new();
+    for base in baseline {
+        let mut fragments = vec![base.clone()];
+        for rtb in &rtb_scenes {
+            let mut next = Vec::new();
+            for fragment in fragments {
+                if rtb.end_time_millis <= fragment.start_time_millis
+                    || rtb.start_time_millis >= fragment.end_time_millis
+                {
+                    next.push(fragment);
+                    continue;
+                }
+                if fragment.start_time_millis < rtb.start_time_millis {
+                    let mut before = fragment.clone();
+                    before.end_time_millis = rtb.start_time_millis;
+                    before.scene_id =
+                        format!("{}:segment:{}", before.scene_id, before.start_time_millis);
+                    next.push(before);
+                }
+                if fragment.end_time_millis > rtb.end_time_millis {
+                    let mut after = fragment;
+                    after.start_time_millis = rtb.end_time_millis;
+                    after.scene_id =
+                        format!("{}:segment:{}", after.scene_id, after.start_time_millis);
+                    next.push(after);
+                }
+            }
+            fragments = next;
+        }
+        result.extend(fragments);
+    }
+    result.extend(rtb_scenes);
+    result
+}
+
+fn stable_id(value: &str) -> i64 {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    -((i64::from_be_bytes(bytes) & i64::MAX).max(1))
+}
+
 /// item 하나와 표출 구간으로 [`PlaybackScene`]을 만든다.
 ///
 /// 에셋 참조는 item의 `file_downloads`를 우선 사용하고, 비어 있으면
@@ -302,6 +599,8 @@ fn build_scene(
             .as_ref()
             .and_then(|l| layout_cache.get(&l.id).cloned()),
         asset_refs,
+        rtb: None,
+        fallback_scene: None,
     }
 }
 
