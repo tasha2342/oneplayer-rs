@@ -7,11 +7,13 @@
 //! - NTP 실패 시 CMS `server_time`을 fallback으로 사용
 //! - 마지막 성공 play_data는 로컬에 캐시해 오프라인 부팅에 사용
 
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use chrono::{TimeZone, Utc};
 use chrono_tz::Tz;
@@ -23,6 +25,8 @@ use crate::timeline::{AssetRef, PlaybackTimeline, TimelineBuilder};
 
 use super::state::{EngineEvent, EngineState};
 use super::PlaybackEngine;
+
+static SYNC_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 impl PlaybackEngine {
     /// 동기화 무한 루프. 설정된 주기(기본 5분)마다 [`Self::sync_once`]를 실행한다.
@@ -53,6 +57,16 @@ impl PlaybackEngine {
     /// 4. revision이 바뀌었으면 → 타임라인 재구성
     ///    → 선다운로드(blocking) + 나머지 백그라운드 다운로드 → 재생 루프 재시작
     pub(crate) async fn sync_once(self: &Arc<Self>) -> Result<()> {
+        let sync_id = SYNC_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let sync_started = Instant::now();
+        let sync_now = self.clock.now_millis();
+        info!(
+            api_stage = "sync_started",
+            sync_id,
+            device_id = %self.settings.device_id,
+            now_millis = sync_now,
+            "schedule synchronization started"
+        );
         self.set_state(EngineState::Syncing).await;
         let _ = self.events.send(EngineEvent::Status("syncing".into()));
 
@@ -63,15 +77,48 @@ impl PlaybackEngine {
             .sync_with_ntp(&ntp, &self.settings.ntp_server)
             .await;
         if !ntp_result.success {
-            warn!("NTP sync failed, using stale/server fallback if available");
+            warn!(
+                api_stage = "ntp_sync_failed",
+                sync_id,
+                ntp_server = %self.settings.ntp_server,
+                confidence = ?ntp_result.snapshot.confidence,
+                source = %ntp_result.snapshot.source,
+                warning = ntp_result.snapshot.warning.as_deref().unwrap_or(""),
+                "NTP sync failed, using stale/server fallback if available"
+            );
+        } else {
+            info!(
+                api_stage = "ntp_sync_completed",
+                sync_id,
+                ntp_server = %self.settings.ntp_server,
+                round_trip_millis = ?ntp_result.round_trip_millis,
+                offset_millis = ntp_result.snapshot.offset_millis,
+                confidence = ?ntp_result.snapshot.confidence,
+                "NTP synchronization completed"
+            );
         }
 
         // 2. play_data 조회. server_time이 있으면 클럭 보조 보정에 사용한다.
         let date = playback_date(self.clock.now_millis());
-        let data = self
+        let data = match self
             .cms
             .get_playback_data(&self.settings.device_id, &date)
-            .await?;
+            .await
+        {
+            Ok(data) => data,
+            Err(err) => {
+                error!(
+                    api_stage = "play_data_fetch_failed",
+                    sync_id,
+                    device_id = %self.settings.device_id,
+                    date,
+                    elapsed_ms = sync_started.elapsed().as_millis(),
+                    error = %format!("{err:#}"),
+                    "schedule synchronization failed while fetching play_data"
+                );
+                return Err(err);
+            }
+        };
         if let Some(server_time) = &data.server_time {
             self.clock.apply_server_time(server_time);
         }
@@ -81,6 +128,12 @@ impl PlaybackEngine {
         //    날짜가 바뀌었으면 현재 시각 기준으로 재구성한다 (스케줄 소진 방지).
         let last = self.last_revision.lock().await.clone();
         if last.as_deref() == Some(data.revision.as_str()) {
+            info!(
+                api_stage = "revision_unchanged",
+                sync_id,
+                revision = %data.revision,
+                "CMS revision unchanged; checking preload assets"
+            );
             self.download_missing_preload_assets().await?;
             if self.timeline_needs_refresh(&data).await {
                 info!(revision = %data.revision, "timeline window low, rebuilding");
@@ -88,14 +141,63 @@ impl PlaybackEngine {
                 // 동일 revision 재구성이므로 오프라인 캐시는 다시 쓰지 않는다.
                 self.apply_timeline(&timeline).await?;
             }
+            info!(
+                api_stage = "sync_completed",
+                sync_id,
+                revision = %data.revision,
+                revision_changed = false,
+                elapsed_ms = sync_started.elapsed().as_millis(),
+                "schedule synchronization completed"
+            );
             return Ok(());
         }
 
         // 4. revision 변경 → 타임라인 재구성.
+        info!(
+            api_stage = "revision_changed",
+            sync_id,
+            previous_revision = last.as_deref().unwrap_or(""),
+            new_revision = %data.revision,
+            normal_slot_count = data.slots.len(),
+            rtb_slot_count = data.rtb_slots.len(),
+            "CMS revision changed; rebuilding timeline"
+        );
         let timeline = TimelineBuilder::build(&data, self.clock.now_millis());
         // 오프라인 부팅용으로 마지막 성공 응답을 저장한다.
-        CmsApiClient::save_playback_cache(&self.settings.playback_cache_path(), &data)?;
-        self.apply_timeline(&timeline).await?;
+        if let Err(err) =
+            CmsApiClient::save_playback_cache(&self.settings.playback_cache_path(), &data)
+        {
+            error!(
+                api_stage = "play_data_cache_save_failed",
+                sync_id,
+                revision = %data.revision,
+                path = %self.settings.playback_cache_path().display(),
+                error = %format!("{err:#}"),
+                "failed to save play_data cache"
+            );
+            return Err(err);
+        }
+        if let Err(err) = self.apply_timeline(&timeline).await {
+            error!(
+                api_stage = "timeline_apply_failed",
+                sync_id,
+                revision = %data.revision,
+                scene_count = timeline.scenes.len(),
+                elapsed_ms = sync_started.elapsed().as_millis(),
+                error = %format!("{err:#}"),
+                "failed to apply playback timeline"
+            );
+            return Err(err);
+        }
+        info!(
+            api_stage = "sync_completed",
+            sync_id,
+            revision = %data.revision,
+            revision_changed = true,
+            scene_count = timeline.scenes.len(),
+            elapsed_ms = sync_started.elapsed().as_millis(),
+            "schedule synchronization completed"
+        );
         Ok(())
     }
 
@@ -122,6 +224,19 @@ impl PlaybackEngine {
     /// 타임라인을 활성화한다: preload window 에셋 blocking 준비
     /// → 나머지 백그라운드 다운로드 → 활성 타임라인 교체 → 재생 루프 재시작.
     async fn apply_timeline(self: &Arc<Self>, timeline: &PlaybackTimeline) -> Result<()> {
+        let apply_started = Instant::now();
+        let rtb_scene_count = timeline
+            .scenes
+            .iter()
+            .filter(|scene| scene.rtb.is_some())
+            .count();
+        info!(
+            api_stage = "timeline_apply_started",
+            revision = %timeline.revision,
+            scene_count = timeline.scenes.len(),
+            rtb_scene_count,
+            "playback timeline apply started"
+        );
         if let Ok(mut failed) = self.failed_rtb_slots.lock() {
             failed.clear();
         }
@@ -150,7 +265,29 @@ impl PlaybackEngine {
             .filter(|asset| baseline_keys.contains(&asset.cache_key()))
             .cloned()
             .collect();
-        self.assets.ensure_assets(&baseline).await?;
+        info!(
+            api_stage = "baseline_preload_started",
+            revision = %timeline.revision,
+            asset_count = baseline.len(),
+            "baseline/fallback asset preload started"
+        );
+        if let Err(err) = self.assets.ensure_assets(&baseline).await {
+            error!(
+                api_stage = "baseline_preload_failed",
+                revision = %timeline.revision,
+                asset_count = baseline.len(),
+                elapsed_ms = apply_started.elapsed().as_millis(),
+                error = %format!("{err:#}"),
+                "baseline/fallback asset preload failed; timeline cannot be applied"
+            );
+            return Err(err);
+        }
+        info!(
+            api_stage = "baseline_preload_completed",
+            revision = %timeline.revision,
+            asset_count = baseline.len(),
+            "baseline/fallback asset preload completed"
+        );
         for asset in blocking
             .iter()
             .filter(|asset| !baseline_keys.contains(&asset.cache_key()))
@@ -172,9 +309,21 @@ impl PlaybackEngine {
                     failed.extend(slot_ids.iter().cloned());
                 }
                 warn!(
+                    api_stage = "rtb_preload_failed",
                     slots = ?slot_ids,
+                    file_id = asset.file_id,
+                    cache_key = %asset.cache_key(),
+                    mime_type = asset.mime_type.as_deref().unwrap_or(""),
                     error = %err,
                     "RTB preload failed; baseline fallback will be used"
+                );
+            } else {
+                debug!(
+                    api_stage = "rtb_preload_completed",
+                    file_id = asset.file_id,
+                    cache_key = %asset.cache_key(),
+                    mime_type = asset.mime_type.as_deref().unwrap_or(""),
+                    "RTB asset preload completed"
                 );
             }
         }
@@ -193,6 +342,15 @@ impl PlaybackEngine {
             scene_count: timeline.scenes.len(),
         });
         self.spawn_playback_loop(timeline.clone());
+        info!(
+            api_stage = "timeline_apply_completed",
+            revision = %timeline.revision,
+            scene_count = timeline.scenes.len(),
+            rtb_scene_count,
+            failed_rtb_slot_count = self.failed_rtb_slots.lock().map(|v| v.len()).unwrap_or(0),
+            elapsed_ms = apply_started.elapsed().as_millis(),
+            "playback timeline applied"
+        );
         Ok(())
     }
 

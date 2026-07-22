@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::clock::Clock;
 use crate::config::{
@@ -340,8 +340,15 @@ impl PlaybackEngine {
             failed.insert(rtb.slot_id.clone());
         }
         warn!(
+            api_stage = "rtb_runtime_fallback",
+            reason = "asset_not_ready",
             scene_id = %scene.scene_id,
             slot_id = %rtb.slot_id,
+            request_id = rtb.request_id.as_deref().unwrap_or(""),
+            bid_id = %rtb.bid_id,
+            creative_id = %rtb.creative_id,
+            asset_count = scene.asset_refs.len(),
+            has_fallback = scene.fallback_scene.is_some(),
             "RTB slot disabled; using baseline fallback"
         );
     }
@@ -409,6 +416,7 @@ impl PlaybackEngine {
         }
         let delay = actual_time_millis - target_time_millis;
         info!(
+            api_stage = "scene_switch_completed",
             step = 8,
             scene_id,
             target_time_millis,
@@ -427,7 +435,13 @@ impl PlaybackEngine {
     /// 렌더 스레드가 전환에 실패했을 때 호출하는 콜백.
     /// fallback 정책상 실패 시 현재 scene이 유지되므로 여기서는 기록만 한다.
     pub fn on_switch_failed(&self, scene_id: &str, reason: &str) {
-        warn!(step = 8, scene_id, reason, "switch failed");
+        error!(
+            api_stage = "scene_switch_failed",
+            step = 8,
+            scene_id,
+            reason,
+            "scene prepare or switch failed"
+        );
         let _ = self.events.send(EngineEvent::SwitchFailed {
             scene_id: scene_id.to_string(),
             reason: reason.to_string(),
@@ -443,21 +457,69 @@ impl PlaybackEngine {
             .lock()
             .ok()
             .and_then(|scenes| scenes.get(scene_id).cloned());
+        let is_rtb = metadata.is_some();
         if let Some(metadata) = metadata {
+            warn!(
+                api_stage = "rtb_prepare_fallback",
+                reason = "scene_prepare_or_switch_failed",
+                scene_id,
+                slot_id = %metadata.metadata.slot_id,
+                request_id = metadata.metadata.request_id.as_deref().unwrap_or(""),
+                bid_id = %metadata.metadata.bid_id,
+                creative_id = %metadata.metadata.creative_id,
+                error = reason,
+                has_fallback = fallback.is_some(),
+                "RTB scene failed; slot disabled and fallback requested"
+            );
             if let Ok(mut failed) = self.failed_rtb_slots.lock() {
-                failed.insert(metadata.metadata.slot_id);
+                failed.insert(metadata.metadata.slot_id.clone());
             }
         }
         if let Some(fallback) = fallback {
             let now = self.clock.now_millis();
             if self.scene_assets_ready(&fallback) {
+                info!(
+                    api_stage = "fallback_dispatch_started",
+                    failed_scene_id = scene_id,
+                    fallback_scene_id = %fallback.scene_id,
+                    target_time_millis = now,
+                    asset_count = fallback.asset_refs.len(),
+                    "baseline fallback dispatch started"
+                );
                 let command = SwitchCommand {
                     local_files: self.scene_local_files(&fallback),
                     scene: fallback,
                     target_time_millis: now,
                 };
-                let _ = self.switch_tx.send(command);
+                if let Err(err) = self.switch_tx.send(command) {
+                    error!(
+                        api_stage = "fallback_dispatch_failed",
+                        failed_scene_id = scene_id,
+                        error = %err,
+                        "fallback switch channel is closed"
+                    );
+                }
+            } else {
+                error!(
+                    api_stage = "fallback_asset_not_ready",
+                    failed_scene_id = scene_id,
+                    fallback_scene_id = %fallback.scene_id,
+                    asset_count = fallback.asset_refs.len(),
+                    "fallback scene assets are not ready; current screen will remain"
+                );
             }
+        } else if is_rtb {
+            error!(
+                api_stage = "fallback_scene_missing",
+                failed_scene_id = scene_id,
+                "failed RTB scene has no baseline fallback"
+            );
+        } else {
+            warn!(
+                api_stage = "normal_scene_failure_no_fallback",
+                failed_scene_id = scene_id,
+                "normal scene failed; current screen will remain"
+            );
         }
     }
 
@@ -543,6 +605,18 @@ impl PlaybackEngine {
         let Some(tracking_scene) = tracking_scene else {
             return;
         };
+        info!(
+            api_stage = "tracking_session_started",
+            slot_id = %tracking_scene.metadata.slot_id,
+            request_id = tracking_scene.metadata.request_id.as_deref().unwrap_or(""),
+            bid_id = %tracking_scene.metadata.bid_id,
+            creative_id = %tracking_scene.metadata.creative_id,
+            scene_id,
+            started_at_millis,
+            duration_millis = tracking_scene.duration_millis,
+            tracking_url_count = tracking_scene.metadata.tracking.len(),
+            "RTB tracking session started after actual scene switch"
+        );
 
         self.tracking_reporter.record(
             &tracking_scene.metadata,
@@ -563,6 +637,17 @@ impl PlaybackEngine {
                     (target - previous).max(0) as u64
                 ))
                 .await;
+                debug!(
+                    api_stage = "tracking_threshold_reached",
+                    slot_id = %metadata.slot_id,
+                    bid_id = %metadata.bid_id,
+                    creative_id = %metadata.creative_id,
+                    scene_id = %timer_scene_id,
+                    event = event.as_str(),
+                    elapsed_millis = target,
+                    duration_millis,
+                    "RTB tracking threshold reached"
+                );
                 reporter.record(&metadata, &timer_scene_id, event);
                 previous = target;
             }
@@ -589,11 +674,38 @@ impl PlaybackEngine {
             return;
         };
         active.abort.abort();
-        if ended_at_millis >= active.started_at_millis + active.duration_millis {
+        let displayed_millis = (ended_at_millis - active.started_at_millis).max(0);
+        if displayed_millis >= active.duration_millis {
+            info!(
+                api_stage = "tracking_session_completed",
+                slot_id = %active.metadata.slot_id,
+                bid_id = %active.metadata.bid_id,
+                creative_id = %active.metadata.creative_id,
+                scene_id = %active.scene_id,
+                started_at_millis = active.started_at_millis,
+                ended_at_millis,
+                displayed_millis,
+                duration_millis = active.duration_millis,
+                "RTB tracking session completed"
+            );
             self.tracking_reporter.record(
                 &active.metadata,
                 &active.scene_id,
                 TrackingEvent::Complete,
+            );
+        } else {
+            warn!(
+                api_stage = "tracking_session_interrupted",
+                slot_id = %active.metadata.slot_id,
+                bid_id = %active.metadata.bid_id,
+                creative_id = %active.metadata.creative_id,
+                scene_id = %active.scene_id,
+                started_at_millis = active.started_at_millis,
+                ended_at_millis,
+                displayed_millis,
+                duration_millis = active.duration_millis,
+                missing_millis = active.duration_millis - displayed_millis,
+                "RTB tracking session ended before complete; remaining events cancelled"
             );
         }
     }

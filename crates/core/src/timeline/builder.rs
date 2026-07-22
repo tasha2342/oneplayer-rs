@@ -12,7 +12,7 @@ use std::sync::Arc;
 use chrono::{Local, NaiveDate, NaiveTime};
 use chrono_tz::Tz;
 use sha2::{Digest, Sha256};
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::cms::{
     FileDownloadDto, LayoutDto, PlaybackAssetDto, PlaybackDataDto, PlaybackItemDto,
@@ -47,6 +47,14 @@ impl TimelineBuilder {
     /// `now_millis`는 SignageClock 기준 현재 시각으로, 다중 item slot의
     /// 확장 window(과거 2분 / 미래 30분) 기준점이 된다.
     pub fn build(data: &PlaybackDataDto, now_millis: i64) -> PlaybackTimeline {
+        info!(
+            api_stage = "timeline_build_started",
+            revision = %data.revision,
+            normal_slot_count = data.slots.len(),
+            rtb_slot_count = data.rtb_slots.len(),
+            now_millis,
+            "playback timeline build started"
+        );
         let zone_id = Self::resolve_timezone(data);
         let local_date = Self::resolve_date(data);
         // 최상위 assets 목록을 file_id로 색인해 두고,
@@ -91,6 +99,15 @@ impl TimelineBuilder {
                 .then(a.end_time_millis.cmp(&b.end_time_millis))
                 .then(a.schedule_id.cmp(&b.schedule_id))
         });
+        let rtb_scene_count = scenes.iter().filter(|scene| scene.rtb.is_some()).count();
+        info!(
+            api_stage = "timeline_build_completed",
+            revision = %data.revision,
+            baseline_scene_count = baseline_scenes.len(),
+            rtb_scene_count,
+            effective_scene_count = scenes.len(),
+            "playback timeline build completed"
+        );
 
         PlaybackTimeline {
             device_id: data.device_id.clone(),
@@ -130,15 +147,49 @@ impl TimelineBuilder {
         let mut accepted_end = i64::MIN;
         for (_, slot, (slot_start, slot_end)) in slots {
             if slot_start < accepted_end {
-                warn!(slot_id = %slot.id, "ignoring overlapping RTB slot");
+                warn!(
+                    api_stage = "rtb_slot_rejected",
+                    reason = "overlapping_slot",
+                    slot_id = %slot.id,
+                    slot_start_millis = slot_start,
+                    slot_end_millis = slot_end,
+                    previous_accepted_end_millis = accepted_end,
+                    "ignoring overlapping RTB slot"
+                );
                 continue;
             }
             match build_rtb_slot_scenes(data, slot, baseline, slot_start, slot_end, now_millis) {
                 Some(mut scenes) if !scenes.is_empty() => {
+                    info!(
+                        api_stage = "rtb_slot_accepted",
+                        slot_id = %slot.id,
+                        request_id = slot.request_id.as_deref().unwrap_or(""),
+                        slot_start_millis = slot_start,
+                        slot_end_millis = slot_end,
+                        item_count = slot.items.len(),
+                        generated_scene_count = scenes.len(),
+                        "RTB slot accepted"
+                    );
                     accepted_end = slot_end;
                     result.append(&mut scenes);
                 }
-                _ => warn!(slot_id = %slot.id, "ignoring invalid RTB slot"),
+                Some(_) => debug!(
+                    api_stage = "rtb_slot_outside_window",
+                    slot_id = %slot.id,
+                    slot_start_millis = slot_start,
+                    slot_end_millis = slot_end,
+                    "RTB slot is valid but outside current expansion window"
+                ),
+                None => warn!(
+                    api_stage = "rtb_slot_rejected",
+                    reason = "invalid_slot",
+                    slot_id = %slot.id,
+                    request_id = slot.request_id.as_deref().unwrap_or(""),
+                    slot_start_millis = slot_start,
+                    slot_end_millis = slot_end,
+                    item_count = slot.items.len(),
+                    "ignoring invalid RTB slot"
+                ),
             }
         }
         result
@@ -330,14 +381,58 @@ fn build_rtb_slot_scenes(
     slot_end: i64,
     now_millis: i64,
 ) -> Option<Vec<PlaybackScene>> {
-    if slot.id.trim().is_empty() || slot.items.is_empty() || slot_start >= slot_end {
+    if slot.id.trim().is_empty() {
+        warn!(
+            api_stage = "rtb_slot_validation_failed",
+            reason = "empty_slot_id",
+            request_id = slot.request_id.as_deref().unwrap_or(""),
+            "RTB slot validation failed"
+        );
+        return None;
+    }
+    if slot.items.is_empty() {
+        warn!(
+            api_stage = "rtb_slot_validation_failed",
+            reason = "empty_items",
+            slot_id = %slot.id,
+            request_id = slot.request_id.as_deref().unwrap_or(""),
+            "RTB slot validation failed"
+        );
+        return None;
+    }
+    if slot_start >= slot_end {
+        warn!(
+            api_stage = "rtb_slot_validation_failed",
+            reason = "invalid_time_range",
+            slot_id = %slot.id,
+            slot_start_millis = slot_start,
+            slot_end_millis = slot_end,
+            "RTB slot validation failed"
+        );
         return None;
     }
 
     let mut items = slot.items.clone();
     items.sort_by_key(|item| item.position);
-    if items.iter().any(|item| !valid_rtb_item(item)) {
-        return None;
+    for item in &items {
+        if let Err(reason) = validate_rtb_item(item) {
+            warn!(
+                api_stage = "rtb_item_validation_failed",
+                reason,
+                slot_id = %slot.id,
+                request_id = slot.request_id.as_deref().unwrap_or(""),
+                bid_id = %item.bid_id,
+                creative_id = %item.creative_id,
+                position = item.position,
+                asset_type = %item.asset.asset_type,
+                mime_type = %item.asset.mime_type,
+                width = item.asset.width,
+                height = item.asset.height,
+                duration_seconds = item.asset.duration_seconds,
+                "RTB item validation failed; entire RTB slot will fallback"
+            );
+            return None;
+        }
     }
 
     let durations: Vec<i64> = items
@@ -346,6 +441,13 @@ fn build_rtb_slot_scenes(
         .collect();
     let cycle_ms: i64 = durations.iter().sum();
     if cycle_ms <= 0 {
+        warn!(
+            api_stage = "rtb_slot_validation_failed",
+            reason = "non_positive_cycle_duration",
+            slot_id = %slot.id,
+            cycle_millis = cycle_ms,
+            "RTB slot validation failed"
+        );
         return None;
     }
 
@@ -381,20 +483,33 @@ fn build_rtb_slot_scenes(
     Some(scenes)
 }
 
-fn valid_rtb_item(item: &RtbItemDto) -> bool {
+fn validate_rtb_item(item: &RtbItemDto) -> Result<(), &'static str> {
     let asset = &item.asset;
-    let supported = matches!(
+    if !matches!(
         (asset.asset_type.as_str(), asset.mime_type.as_str()),
         ("video", "video/mp4") | ("image", "image/jpeg") | ("image", "image/png")
-    );
-    supported
-        && !item.bid_id.trim().is_empty()
-        && !item.creative_id.trim().is_empty()
-        && asset.download_url.starts_with("https://")
-        && asset.width > 0
-        && asset.height > 0
-        && asset.duration_seconds > 0
-        && asset.size_bytes.map_or(true, |size| size > 0)
+    ) {
+        return Err("unsupported_asset_type_or_mime");
+    }
+    if item.bid_id.trim().is_empty() {
+        return Err("empty_bid_id");
+    }
+    if item.creative_id.trim().is_empty() {
+        return Err("empty_creative_id");
+    }
+    if !asset.download_url.starts_with("https://") {
+        return Err("asset_url_must_be_https");
+    }
+    if asset.width <= 0 || asset.height <= 0 {
+        return Err("non_positive_asset_dimensions");
+    }
+    if asset.duration_seconds <= 0 {
+        return Err("non_positive_asset_duration");
+    }
+    if asset.size_bytes.is_some_and(|size| size <= 0) {
+        return Err("non_positive_asset_size");
+    }
+    Ok(())
 }
 
 fn build_rtb_scene(
@@ -461,21 +576,66 @@ fn build_rtb_scene(
             fallback.fallback_scene = None;
             Box::new(fallback)
         });
+    if fallback_scene.is_none() {
+        warn!(
+            api_stage = "rtb_fallback_missing",
+            slot_id = %slot.id,
+            bid_id = %item.bid_id,
+            creative_id = %item.creative_id,
+            scene_id = %scene_id,
+            start_time_millis = start_millis,
+            end_time_millis = end_millis,
+            "RTB scene has no overlapping baseline scene; failure may leave current screen unchanged"
+        );
+    }
 
-    let tracking = item
-        .tracking
-        .iter()
-        .filter_map(|entry| {
-            let event = TrackingEvent::parse(&entry.event)?;
-            if !(entry.url.starts_with("https://") || entry.url.starts_with("http://")) {
-                return None;
-            }
-            Some(TrackingUrl {
-                event,
-                url: entry.url.clone(),
-            })
-        })
-        .collect();
+    let mut tracking = Vec::new();
+    for entry in &item.tracking {
+        let Some(event) = TrackingEvent::parse(&entry.event) else {
+            warn!(
+                api_stage = "tracking_definition_rejected",
+                reason = "unknown_event",
+                slot_id = %slot.id,
+                bid_id = %item.bid_id,
+                creative_id = %item.creative_id,
+                event = %entry.event,
+                "unknown tracking event ignored"
+            );
+            continue;
+        };
+        if !(entry.url.starts_with("https://") || entry.url.starts_with("http://")) {
+            warn!(
+                api_stage = "tracking_definition_rejected",
+                reason = "invalid_url_scheme",
+                slot_id = %slot.id,
+                bid_id = %item.bid_id,
+                creative_id = %item.creative_id,
+                event = event.as_str(),
+                url = %url_without_query(&entry.url),
+                "tracking URL ignored"
+            );
+            continue;
+        }
+        tracking.push(TrackingUrl {
+            event,
+            url: entry.url.clone(),
+        });
+    }
+    debug!(
+        api_stage = "rtb_scene_created",
+        slot_id = %slot.id,
+        request_id = slot.request_id.as_deref().unwrap_or(""),
+        bid_id = %item.bid_id,
+        creative_id = %item.creative_id,
+        scene_id = %scene_id,
+        asset_type = %item.asset.asset_type,
+        mime_type = %item.asset.mime_type,
+        start_time_millis = start_millis,
+        end_time_millis = end_millis,
+        tracking_count = tracking.len(),
+        has_fallback = fallback_scene.is_some(),
+        "RTB scene created"
+    );
 
     PlaybackScene {
         scene_id,
@@ -559,6 +719,10 @@ fn stable_id(value: &str) -> i64 {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest[..8]);
     -((i64::from_be_bytes(bytes) & i64::MAX).max(1))
+}
+
+fn url_without_query(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
 }
 
 /// item 하나와 표출 구간으로 [`PlaybackScene`]을 만든다.

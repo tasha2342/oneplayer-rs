@@ -190,6 +190,24 @@ impl App {
                     self.preparing.remove(&scene.scene.scene_id);
                     if let Some(compositor) = self.compositor.as_mut() {
                         let scene_id = scene.scene.scene_id.clone();
+                        let rtb_slot_id = scene
+                            .scene
+                            .rtb
+                            .as_ref()
+                            .map(|v| v.slot_id.clone())
+                            .unwrap_or_default();
+                        let bid_id = scene
+                            .scene
+                            .rtb
+                            .as_ref()
+                            .map(|v| v.bid_id.clone())
+                            .unwrap_or_default();
+                        let creative_id = scene
+                            .scene
+                            .rtb
+                            .as_ref()
+                            .map(|v| v.creative_id.clone())
+                            .unwrap_or_default();
                         let preload_started = Instant::now();
                         let preload_now = self.clock.now_millis();
                         // 준비된 scene을 hidden 레이어에 GPU 리소스로 올린다.
@@ -199,6 +217,17 @@ impl App {
                         let scheduled_now = self.clock.now_millis();
                         // 목표 시각이 되면 hidden 레이어가 active가 되도록 예약한다.
                         compositor.switch_at(target_time_millis);
+                        info!(
+                            api_stage = "gpu_preload_completed",
+                            scene_id = %scene_id,
+                            is_rtb = !rtb_slot_id.is_empty(),
+                            rtb_slot_id = %rtb_slot_id,
+                            bid_id = %bid_id,
+                            creative_id = %creative_id,
+                            target_time_millis,
+                            gpu_preload_ms,
+                            "scene GPU preload completed and switch scheduled"
+                        );
                         timing_log::record(
                             "INFO",
                             11,
@@ -271,6 +300,21 @@ impl App {
                     ("is_video", TimingValue::from(scene.has_video())),
                 ],
             );
+            let rtb = scene.rtb.as_ref();
+            info!(
+                api_stage = "scene_prepare_dispatched",
+                scene_id = %scene_id,
+                is_rtb = rtb.is_some(),
+                rtb_slot_id = rtb.map(|v| v.slot_id.as_str()).unwrap_or(""),
+                request_id = rtb.and_then(|v| v.request_id.as_deref()).unwrap_or(""),
+                bid_id = rtb.map(|v| v.bid_id.as_str()).unwrap_or(""),
+                creative_id = rtb.map(|v| v.creative_id.as_str()).unwrap_or(""),
+                target_time_millis,
+                now_millis,
+                asset_count = scene.asset_refs.len(),
+                has_video = scene.has_video(),
+                "scene prepare dispatched to blocking worker"
+            );
             let clock = self.clock.clone();
             // 이미지 decode, 영상 open/preroll은 오래 걸릴 수 있으므로 렌더 루프에서 직접 하지 않는다.
             // 별도 blocking 스레드에서 처리해 기존 화면 렌더링이 계속 돌 수 있게 한다.
@@ -290,6 +334,18 @@ impl App {
                     // ScenePreparer는 이미지 캐시와 디코더 pool을 소유하므로 한 번에 하나씩 접근한다.
                     Ok(mut preparer) => match preparer.prepare(&scene, &local_files, now_millis) {
                         Ok(prepared) => {
+                            let rtb = scene.rtb.as_ref();
+                            info!(
+                                api_stage = "scene_prepare_completed",
+                                scene_id = %scene_id,
+                                is_rtb = rtb.is_some(),
+                                rtb_slot_id = rtb.map(|v| v.slot_id.as_str()).unwrap_or(""),
+                                bid_id = rtb.map(|v| v.bid_id.as_str()).unwrap_or(""),
+                                creative_id = rtb.map(|v| v.creative_id.as_str()).unwrap_or(""),
+                                target_time_millis,
+                                elapsed_ms = prepare_started.elapsed().as_millis(),
+                                "scene prepare completed"
+                            );
                             timing_log::record(
                                 "INFO",
                                 10,
@@ -309,6 +365,20 @@ impl App {
                             }
                         }
                         Err(err) => {
+                            let rtb = scene.rtb.as_ref();
+                            error!(
+                                api_stage = "scene_prepare_failed",
+                                scene_id = %scene_id,
+                                is_rtb = rtb.is_some(),
+                                rtb_slot_id = rtb.map(|v| v.slot_id.as_str()).unwrap_or(""),
+                                request_id = rtb.and_then(|v| v.request_id.as_deref()).unwrap_or(""),
+                                bid_id = rtb.map(|v| v.bid_id.as_str()).unwrap_or(""),
+                                creative_id = rtb.map(|v| v.creative_id.as_str()).unwrap_or(""),
+                                target_time_millis,
+                                elapsed_ms = prepare_started.elapsed().as_millis(),
+                                error = %format!("{err:#}"),
+                                "scene prepare failed"
+                            );
                             timing_log::record(
                                 "ERROR",
                                 "ERROR",

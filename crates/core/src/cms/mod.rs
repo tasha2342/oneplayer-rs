@@ -11,15 +11,18 @@ mod dto;
 pub use dto::*;
 
 use std::path::Path;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
-use tracing::info;
+use tracing::{debug, error, info};
 
 use crate::settings::AppSettings;
+
+static CMS_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// CMS HTTP API 클라이언트.
 #[derive(Clone)]
@@ -77,8 +80,25 @@ impl CmsApiClient {
             urlencoding::encode(device_id),
             urlencoding::encode(date)
         );
-        info!(%url, "fetching playback data");
+        info!(
+            api_stage = "play_data_request",
+            device_id,
+            date,
+            %url,
+            "CMS playback data fetch started"
+        );
         let response: PlaybackDataResponse = self.get_json(&url).await?;
+        info!(
+            api_stage = "play_data_parsed",
+            device_id,
+            date,
+            api_version = response.data.api_version.as_deref().unwrap_or("1.0"),
+            revision = %response.data.revision,
+            slot_count = response.data.slots.len(),
+            rtb_slot_count = response.data.rtb_slots.len(),
+            asset_count = response.data.assets.len(),
+            "CMS playback data parsed"
+        );
         Ok(response.data)
     }
 
@@ -98,6 +118,14 @@ impl CmsApiClient {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, serde_json::to_string_pretty(data)?)?;
+        info!(
+            api_stage = "play_data_cache_saved",
+            path = %path.display(),
+            revision = %data.revision,
+            slot_count = data.slots.len(),
+            rtb_slot_count = data.rtb_slots.len(),
+            "playback cache saved"
+        );
         Ok(())
     }
 
@@ -107,7 +135,24 @@ impl CmsApiClient {
             return Ok(None);
         }
         let raw = std::fs::read_to_string(path)?;
-        let data = serde_json::from_str(&raw)?;
+        let data: PlaybackDataDto = serde_json::from_str(&raw).map_err(|err| {
+            error!(
+                api_stage = "play_data_cache_parse_failed",
+                path = %path.display(),
+                body_bytes = raw.len(),
+                error = %err,
+                "failed to parse cached playback data"
+            );
+            err
+        })?;
+        info!(
+            api_stage = "play_data_cache_loaded",
+            path = %path.display(),
+            revision = %data.revision,
+            slot_count = data.slots.len(),
+            rtb_slot_count = data.rtb_slots.len(),
+            "playback cache loaded"
+        );
         Ok(Some(data))
     }
 
@@ -124,34 +169,175 @@ impl CmsApiClient {
     /// GET 요청을 보내고 JSON을 역직렬화한다.
     /// 인증 토큰이 설정돼 있으면 `Authorization: Bearer` 헤더를 붙인다.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+        let request_id = CMS_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
         let mut req = self.client.get(url);
         if let Some(token) = &self.auth_token {
             req = req.header("Authorization", format!("Bearer {token}"));
         }
-        let response = req.send().await.context("CMS request failed")?;
+        debug!(
+            api_stage = "http_request_started",
+            request_id,
+            method = "GET",
+            %url,
+            has_auth = self.auth_token.is_some(),
+            "CMS HTTP request started"
+        );
+        let response = match req.send().await {
+            Ok(response) => response,
+            Err(err) => {
+                error!(
+                    api_stage = "http_transport_failed",
+                    request_id,
+                    method = "GET",
+                    %url,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    is_timeout = err.is_timeout(),
+                    is_connect = err.is_connect(),
+                    error = %err,
+                    "CMS HTTP transport failed"
+                );
+                return Err(err).context("CMS request failed");
+            }
+        };
         let status = response.status();
-        let body = response.text().await.context("failed to read CMS body")?;
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(err) => {
+                error!(
+                    api_stage = "http_body_read_failed",
+                    request_id,
+                    method = "GET",
+                    %url,
+                    status = %status,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    error = %err,
+                    "failed to read CMS response body"
+                );
+                return Err(err).context("failed to read CMS body");
+            }
+        };
+        debug!(
+            api_stage = "http_response_received",
+            request_id,
+            method = "GET",
+            %url,
+            status = %status,
+            body_bytes = body.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "CMS HTTP response received"
+        );
         if !status.is_success() {
+            error!(
+                api_stage = "http_status_failed",
+                request_id,
+                method = "GET",
+                %url,
+                status = %status,
+                body_preview = %body_preview(&body),
+                elapsed_ms = started.elapsed().as_millis(),
+                "CMS returned failure status"
+            );
             anyhow::bail!("CMS request failed: {status} {body}");
         }
-        serde_json::from_str(&body).with_context(|| format!("failed to parse CMS JSON from {url}"))
+        serde_json::from_str(&body).map_err(|err| {
+            error!(
+                api_stage = "json_parse_failed",
+                request_id,
+                method = "GET",
+                %url,
+                status = %status,
+                body_bytes = body.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                error = %err,
+                "failed to parse CMS JSON"
+            );
+            anyhow::Error::new(err).context(format!("failed to parse CMS JSON from {url}"))
+        })
     }
 
     /// JSON POST 요청을 보내고 성공 status만 확인한다.
     async fn post_json<T: Serialize + ?Sized>(&self, url: &str, body: &T) -> Result<()> {
+        let request_id = CMS_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
         let mut req = self.client.post(url).json(body);
         if let Some(token) = &self.auth_token {
             req = req.header("Authorization", format!("Bearer {token}"));
         }
-        let response = req.send().await.context("CMS POST request failed")?;
+        debug!(
+            api_stage = "http_request_started",
+            request_id,
+            method = "POST",
+            %url,
+            has_auth = self.auth_token.is_some(),
+            "CMS HTTP request started"
+        );
+        let response = match req.send().await {
+            Ok(response) => response,
+            Err(err) => {
+                error!(
+                    api_stage = "http_transport_failed",
+                    request_id,
+                    method = "POST",
+                    %url,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    is_timeout = err.is_timeout(),
+                    is_connect = err.is_connect(),
+                    error = %err,
+                    "CMS POST transport failed"
+                );
+                return Err(err).context("CMS POST request failed");
+            }
+        };
         let status = response.status();
-        let text = response
-            .text()
-            .await
-            .context("failed to read CMS POST body")?;
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(err) => {
+                error!(
+                    api_stage = "http_body_read_failed",
+                    request_id,
+                    method = "POST",
+                    %url,
+                    status = %status,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    error = %err,
+                    "failed to read CMS POST response body"
+                );
+                return Err(err).context("failed to read CMS POST body");
+            }
+        };
         if !status.is_success() {
+            error!(
+                api_stage = "http_status_failed",
+                request_id,
+                method = "POST",
+                %url,
+                status = %status,
+                body_preview = %body_preview(&text),
+                elapsed_ms = started.elapsed().as_millis(),
+                "CMS POST returned failure status"
+            );
             anyhow::bail!("CMS POST request failed: {status} {text}");
         }
+        debug!(
+            api_stage = "http_request_completed",
+            request_id,
+            method = "POST",
+            %url,
+            status = %status,
+            body_bytes = text.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "CMS POST completed"
+        );
         Ok(())
     }
+}
+
+fn body_preview(body: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    let mut preview: String = body.chars().take(MAX_CHARS).collect();
+    if body.chars().count() > MAX_CHARS {
+        preview.push('…');
+    }
+    preview.replace(['\r', '\n'], " ")
 }

@@ -20,10 +20,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
-use tracing::debug;
+use tracing::{debug, error, info};
 
 use crate::settings::AppSettings;
 use crate::timeline::AssetRef;
@@ -145,10 +146,51 @@ impl AssetStore {
             }
             let path = self.local_path(asset);
             if !self.is_ready(asset) {
-                debug!(file_id = asset.file_id, key = %key, "downloading asset");
-                self.download(asset, &path).await?;
+                let source = asset_source(asset);
+                info!(
+                    api_stage = "asset_download_started",
+                    source,
+                    file_id = asset.file_id,
+                    cache_key = %key,
+                    mime_type = asset.mime_type.as_deref().unwrap_or(""),
+                    expected_size_bytes = ?asset.size_bytes,
+                    url = %url_without_query(&asset.download_url),
+                    "asset download started"
+                );
+                if let Err(err) = self.download(asset, &path).await {
+                    error!(
+                        api_stage = "asset_download_failed",
+                        source,
+                        file_id = asset.file_id,
+                        cache_key = %key,
+                        mime_type = asset.mime_type.as_deref().unwrap_or(""),
+                        expected_size_bytes = ?asset.size_bytes,
+                        url = %url_without_query(&asset.download_url),
+                        error = %format!("{err:#}"),
+                        "asset download failed"
+                    );
+                    return Err(err);
+                }
+            } else {
+                debug!(
+                    api_stage = "asset_cache_hit",
+                    source = asset_source(asset),
+                    file_id = asset.file_id,
+                    cache_key = %key,
+                    "asset already available in cache"
+                );
             }
             if !self.is_ready(asset) {
+                error!(
+                    api_stage = "asset_verification_failed",
+                    source = asset_source(asset),
+                    file_id = asset.file_id,
+                    cache_key = %key,
+                    local_path = %path.display(),
+                    expected_size_bytes = ?asset.size_bytes,
+                    has_checksum = asset.checksum.is_some(),
+                    "asset verification failed after download"
+                );
                 anyhow::bail!(
                     "asset verification failed after download file_id={} key={}",
                     asset.file_id,
@@ -158,6 +200,14 @@ impl AssetStore {
             // 접근 시각을 갱신해 LRU 정리에서 뒤로 밀리게 한다.
             touch_file(&path)?;
             touch_file(&self.marker_path(asset))?;
+            debug!(
+                api_stage = "asset_ready",
+                source = asset_source(asset),
+                file_id = asset.file_id,
+                cache_key = %key,
+                local_path = %path.display(),
+                "asset ready"
+            );
             result.insert(key, path);
         }
         Ok(result)
@@ -169,6 +219,7 @@ impl AssetStore {
     /// → atomic rename으로 최종 파일 교체 → `.complete` marker 생성.
     /// 중간에 실패해도 최종 파일은 항상 완전한 상태만 존재한다.
     async fn download(&self, asset: &AssetRef, destination: &Path) -> Result<()> {
+        let started = Instant::now();
         let temp = destination.with_extension("part");
         if let Some(parent) = temp.parent() {
             fs::create_dir_all(parent)?;
@@ -181,16 +232,24 @@ impl AssetStore {
             req = req.header("Authorization", format!("Bearer {token}"));
         }
         let response = req.send().await.context("asset download request failed")?;
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "asset download failed: {} {}",
-                response.status(),
-                asset.file_id
+        let status = response.status();
+        if !status.is_success() {
+            error!(
+                api_stage = "asset_http_status_failed",
+                source = asset_source(asset),
+                file_id = asset.file_id,
+                cache_key = %asset.cache_key(),
+                url = %url_without_query(&url),
+                status = %status,
+                elapsed_ms = started.elapsed().as_millis(),
+                "asset server returned failure status"
             );
+            anyhow::bail!("asset download failed: {} {}", status, asset.file_id);
         }
 
         // 임시 파일에 쓰고 디스크에 확실히 반영(fsync)한다.
         let bytes = response.bytes().await?;
+        let received_size = bytes.len();
         {
             let mut file = fs::File::create(&temp)?;
             file.write_all(&bytes)?;
@@ -202,6 +261,16 @@ impl AssetStore {
             let actual = temp.metadata()?.len();
             if actual != expected as u64 {
                 let _ = fs::remove_file(&temp);
+                error!(
+                    api_stage = "asset_size_mismatch",
+                    source = asset_source(asset),
+                    file_id = asset.file_id,
+                    cache_key = %asset.cache_key(),
+                    expected_size_bytes = expected,
+                    actual_size_bytes = actual,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "downloaded asset size does not match metadata"
+                );
                 anyhow::bail!(
                     "asset size mismatch file_id={} expected={} actual={}",
                     asset.file_id,
@@ -214,6 +283,16 @@ impl AssetStore {
         // atomic rename: 이 시점부터 최종 파일이 완전한 상태로 존재한다.
         fs::rename(&temp, destination)?;
         fs::write(self.marker_path(asset), b"ok")?;
+        info!(
+            api_stage = "asset_download_completed",
+            source = asset_source(asset),
+            file_id = asset.file_id,
+            cache_key = %asset.cache_key(),
+            received_size_bytes = received_size,
+            local_path = %destination.display(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "asset download completed"
+        );
         Ok(())
     }
 
@@ -239,6 +318,18 @@ fn resolve_url(base_url: &str, download_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     let path = download_url.trim_start_matches('/');
     format!("{base}/{path}")
+}
+
+fn asset_source(asset: &AssetRef) -> &'static str {
+    if asset.file_id < 0 {
+        "rtb"
+    } else {
+        "cms"
+    }
+}
+
+fn url_without_query(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
 }
 
 /// `cms_base_url`에서 호스트 origin만 추출한다 (`.../api` 접미사 제거).

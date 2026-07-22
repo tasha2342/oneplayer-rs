@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::warn;
 
 /// `GET /play_data` 응답 최상위 래퍼.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -118,7 +119,21 @@ where
     let values = Vec::<Value>::deserialize(deserializer)?;
     Ok(values
         .into_iter()
-        .filter_map(|value| serde_json::from_value(value).ok())
+        .enumerate()
+        .filter_map(
+            |(index, value)| match serde_json::from_value::<RtbSlotDto>(value) {
+                Ok(slot) => Some(slot),
+                Err(err) => {
+                    warn!(
+                        api_stage = "rtb_dto_parse_failed",
+                        rtb_slot_index = index,
+                        error = %err,
+                        "malformed RTB slot ignored; normal schedule remains available"
+                    );
+                    None
+                }
+            },
+        )
         .collect())
 }
 

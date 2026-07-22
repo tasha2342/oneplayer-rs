@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use oneplayer_core::settings::AppSettings;
-use tracing::info;
+use tracing::{error, info};
 use winit::event_loop::EventLoop;
 
 mod app;
@@ -54,7 +54,13 @@ fn load_settings() -> AppSettings {
 /// (v2 watchdog이 재시작 신호로 사용).
 fn main() -> Result<()> {
     let result = run();
-    if result.is_err() {
+    if let Err(err) = &result {
+        error!(
+            api_stage = "application_fatal_error",
+            error = %format!("{err:#}"),
+            "OnePlayer terminated with a fatal error"
+        );
+        eprintln!("OnePlayer fatal error: {err:#}");
         std::process::exit(1);
     }
     result

@@ -2,13 +2,13 @@
 
 use std::collections::HashSet;
 use std::sync::Mutex as StdMutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::Client;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::timeline::{RtbSceneMetadata, TrackingEvent};
 
@@ -20,7 +20,10 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug)]
 struct TrackingRequest {
-    key: String,
+    slot_id: String,
+    scene_id: String,
+    bid_id: String,
+    creative_id: String,
     event: TrackingEvent,
     url: String,
 }
@@ -65,6 +68,13 @@ impl TrackingReporter {
         if let Ok(mut worker) = self.worker.lock() {
             *worker = Some(handle);
         }
+        info!(
+            api_stage = "tracking_worker_started",
+            queue_capacity = QUEUE_CAPACITY,
+            request_timeout_seconds = REQUEST_TIMEOUT.as_secs(),
+            max_attempts = MAX_ATTEMPTS,
+            "tracking worker started"
+        );
     }
 
     /// 한 이벤트에 등록된 URL들을 non-blocking으로 큐에 넣는다.
@@ -87,10 +97,23 @@ impl TrackingReporter {
                 .map(|mut dedup| dedup.insert(key.clone()))
                 .unwrap_or(false);
             if !inserted {
+                debug!(
+                    api_stage = "tracking_event_deduplicated",
+                    slot_id = %metadata.slot_id,
+                    scene_id,
+                    bid_id = %metadata.bid_id,
+                    creative_id = %metadata.creative_id,
+                    event = event.as_str(),
+                    url = %url_without_query(&tracking.url),
+                    "duplicate tracking event ignored"
+                );
                 continue;
             }
             let request = TrackingRequest {
-                key: key.clone(),
+                slot_id: metadata.slot_id.clone(),
+                scene_id: scene_id.to_string(),
+                bid_id: metadata.bid_id.clone(),
+                creative_id: metadata.creative_id.clone(),
                 event,
                 url: tracking.url.clone(),
             };
@@ -98,12 +121,27 @@ impl TrackingReporter {
                 if let Ok(mut dedup) = self.dedup.lock() {
                     dedup.remove(&key);
                 }
-                warn!(
+                error!(
+                    api_stage = "tracking_enqueue_failed",
                     slot_id = %metadata.slot_id,
                     scene_id,
+                    bid_id = %metadata.bid_id,
+                    creative_id = %metadata.creative_id,
                     event = event.as_str(),
+                    url = %url_without_query(&tracking.url),
                     error = %err,
                     "tracking queue full or closed"
+                );
+            } else {
+                info!(
+                    api_stage = "tracking_enqueued",
+                    slot_id = %metadata.slot_id,
+                    scene_id,
+                    bid_id = %metadata.bid_id,
+                    creative_id = %metadata.creative_id,
+                    event = event.as_str(),
+                    url = %url_without_query(&tracking.url),
+                    "tracking event enqueued"
                 );
             }
         }
@@ -111,6 +149,10 @@ impl TrackingReporter {
 
     /// 앞서 enqueue된 요청을 drain한 뒤 워커를 종료한다.
     pub async fn shutdown(&self) {
+        info!(
+            api_stage = "tracking_shutdown_started",
+            "tracking queue drain started"
+        );
         let (done_tx, done_rx) = oneshot::channel();
         if self
             .tx
@@ -127,9 +169,17 @@ impl TrackingReporter {
                 .is_err()
             {
                 handle.abort();
-                warn!("tracking worker shutdown timed out");
+                error!(
+                    api_stage = "tracking_shutdown_timeout",
+                    timeout_seconds = SHUTDOWN_TIMEOUT.as_secs(),
+                    "tracking worker shutdown timed out"
+                );
             }
         }
+        info!(
+            api_stage = "tracking_shutdown_completed",
+            "tracking worker shutdown completed"
+        );
     }
 }
 
@@ -151,6 +201,19 @@ async fn run_worker(client: Client, mut rx: mpsc::Receiver<TrackingCommand>) {
 
 async fn send_with_retry(client: &Client, request: TrackingRequest) {
     for attempt in 1..=MAX_ATTEMPTS {
+        let started = Instant::now();
+        info!(
+            api_stage = "tracking_http_started",
+            slot_id = %request.slot_id,
+            scene_id = %request.scene_id,
+            bid_id = %request.bid_id,
+            creative_id = %request.creative_id,
+            event = request.event.as_str(),
+            url = %url_without_query(&request.url),
+            attempt,
+            max_attempts = MAX_ATTEMPTS,
+            "tracking HTTP request started"
+        );
         let result = client
             .get(&request.url)
             .send()
@@ -158,19 +221,34 @@ async fn send_with_retry(client: &Client, request: TrackingRequest) {
             .and_then(|response| response.error_for_status().map(|_| ()));
         match result {
             Ok(()) => {
-                debug!(
-                    key = %request.key,
+                info!(
+                    api_stage = "tracking_http_completed",
+                    slot_id = %request.slot_id,
+                    scene_id = %request.scene_id,
+                    bid_id = %request.bid_id,
+                    creative_id = %request.creative_id,
                     event = request.event.as_str(),
+                    url = %url_without_query(&request.url),
                     attempt,
+                    elapsed_ms = started.elapsed().as_millis(),
                     "tracking beacon sent"
                 );
                 return;
             }
             Err(err) if attempt < MAX_ATTEMPTS => {
                 warn!(
-                    key = %request.key,
+                    api_stage = "tracking_http_retry",
+                    slot_id = %request.slot_id,
+                    scene_id = %request.scene_id,
+                    bid_id = %request.bid_id,
+                    creative_id = %request.creative_id,
                     event = request.event.as_str(),
+                    url = %url_without_query(&request.url),
                     attempt,
+                    status = ?err.status(),
+                    is_timeout = err.is_timeout(),
+                    is_connect = err.is_connect(),
+                    elapsed_ms = started.elapsed().as_millis(),
                     error = %err,
                     "tracking beacon failed, retrying"
                 );
@@ -178,16 +256,29 @@ async fn send_with_retry(client: &Client, request: TrackingRequest) {
                 tokio::time::sleep(INITIAL_BACKOFF * factor).await;
             }
             Err(err) => {
-                warn!(
-                    key = %request.key,
+                error!(
+                    api_stage = "tracking_http_failed",
+                    slot_id = %request.slot_id,
+                    scene_id = %request.scene_id,
+                    bid_id = %request.bid_id,
+                    creative_id = %request.creative_id,
                     event = request.event.as_str(),
+                    url = %url_without_query(&request.url),
                     attempt,
+                    status = ?err.status(),
+                    is_timeout = err.is_timeout(),
+                    is_connect = err.is_connect(),
+                    elapsed_ms = started.elapsed().as_millis(),
                     error = %err,
                     "tracking beacon permanently failed"
                 );
             }
         }
     }
+}
+
+fn url_without_query(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
 }
 
 #[cfg(test)]
